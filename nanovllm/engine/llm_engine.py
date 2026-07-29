@@ -10,6 +10,7 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.v1.spec_decode.types import SpecDecodeMetrics
 
 
 class LLMEngine:
@@ -18,8 +19,6 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
-        self.is_spec_decoding = config.speculative_config is not None
-        Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -45,29 +44,59 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
-        seq.keep_token_ids = self.is_spec_decoding
         self.scheduler.add(seq)
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        if not is_prefill and self.scheduler.is_spec_decoding:
-            draft_token_ids = self.model_runner.propose_draft_token_ids(seqs)
-            draft_token_ids, reservations = self.scheduler.reserve_spec_decode(
-                seqs, draft_token_ids
+        preempted_ids = self.scheduler.pop_preempted_seq_ids()
+        if preempted_ids and self.scheduler.speculative_method == "eagle3":
+            self.model_runner.call("release_eagle_states", preempted_ids)
+
+        if is_prefill and self.scheduler.speculative_method == "eagle3":
+            token_ids = self.model_runner.call("run_eagle3_prefill", seqs)
+            num_decode_tokens = self.scheduler.postprocess(seqs, token_ids)
+        elif not is_prefill and self.scheduler.speculative_method == "eagle3":
+            requested = self.scheduler.get_eagle3_requested_lengths(seqs)
+            reservations = self.scheduler.reserve_spec_budget(seqs, requested)
+            proposal, result = self.model_runner.call(
+                "run_eagle3_spec_decode",
+                seqs,
+                reservations,
             )
-            token_ids = self.model_runner.call(
-                "run_spec_decode", seqs, draft_token_ids, reservations
-            )
-            num_tokens = -self.scheduler.postprocess_spec_decode(
-                seqs, token_ids, draft_token_ids, reservations
+            num_decode_tokens = self.scheduler.postprocess_spec_decode(
+                seqs,
+                result,
+                proposal,
+                reservations,
             )
         else:
-            num_tokens = (
-                sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-            )
-            token_ids = self.model_runner.call("run", seqs, is_prefill)
-            self.scheduler.postprocess(seqs, token_ids, is_prefill)
+            if not is_prefill and self.scheduler.speculative_method == "ngram":
+                draft_token_ids = self.model_runner.propose_draft_token_ids(seqs)
+                draft_token_ids, reservations = self.scheduler.reserve_spec_decode(
+                    seqs,
+                    draft_token_ids,
+                )
+                result = self.model_runner.call(
+                    "run_spec_decode",
+                    seqs,
+                    draft_token_ids,
+                    reservations,
+                )
+                num_decode_tokens = self.scheduler.postprocess_spec_decode(
+                    seqs,
+                    result,
+                    draft_token_ids,
+                    reservations,
+                )
+            else:
+                token_ids = self.model_runner.call("run", seqs, is_prefill)
+                num_decode_tokens = self.scheduler.postprocess(seqs, token_ids)
+
+        finished_ids = [seq.seq_id for seq in seqs if seq.is_finished]
+        if finished_ids and self.scheduler.speculative_method == "eagle3":
+            self.model_runner.call("release_eagle_states", finished_ids)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -num_decode_tokens
         return outputs, num_tokens
 
     def is_finished(self):
@@ -77,8 +106,20 @@ class LLMEngine:
     def acceptance_rate(self) -> float:
         return self.scheduler.acceptance_rate
 
+    @property
+    def spec_decode_metrics(self) -> SpecDecodeMetrics:
+        draft_time_ms, verify_time_ms, sampling_time_ms = self.model_runner.call(
+            "get_spec_decode_timings"
+        )
+        return self.scheduler.get_spec_decode_metrics(
+            draft_time_ms,
+            verify_time_ms,
+            sampling_time_ms,
+        )
+
     def reset_spec_decode_metrics(self):
         self.scheduler.reset_spec_decode_metrics()
+        self.model_runner.call("reset_spec_decode_metrics")
 
     def generate(
         self,
@@ -86,7 +127,8 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
-        pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        if use_tqdm:
+            pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
@@ -96,18 +138,21 @@ class LLMEngine:
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
-            pbar.set_postfix({
-                "Prefill": f"{int(prefill_throughput)}tok/s",
-                "Decode": f"{int(decode_throughput)}tok/s",
-            })
+            if use_tqdm:
+                if num_tokens > 0:
+                    prefill_throughput = num_tokens / (perf_counter() - t)
+                else:
+                    decode_throughput = -num_tokens / (perf_counter() - t)
+                pbar.set_postfix({
+                    "Prefill": f"{int(prefill_throughput)}tok/s",
+                    "Decode": f"{int(decode_throughput)}tok/s",
+                })
             for seq_id, token_ids in output:
                 outputs[seq_id] = token_ids
-                pbar.update(1)
-        pbar.close()
+                if use_tqdm:
+                    pbar.update(1)
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
+        if use_tqdm:
+            pbar.close()
         return outputs

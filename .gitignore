@@ -3,9 +3,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 
-# Downloaded model weights
-/models/
-
 # C extensions
 *.so
 
@@ -198,4 +195,7 @@ cython_debug/
 .cursorindexingignore
 
 # TorchInductor generated cache
-torchinductor_*/
+torchinductor_wxtang/
+
+# Local Git worktrees
+.worktrees/

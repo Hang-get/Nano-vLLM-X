@@ -1,4 +1,6 @@
 import pickle
+from time import perf_counter
+
 import torch
 import torch.distributed as dist
 import numpy as np
@@ -8,23 +10,32 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
+from nanovllm.models.model_output import TargetModelOutput
+from nanovllm.models.qwen3_eagle3 import Qwen3Eagle3ForCausalLM
 from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.eagle3_loader import load_eagle3_weights
 from nanovllm.utils.loader import load_model, load_model_arch_from_config
-from nanovllm.v1.sample.rejection_sampler import RejectionSampler
+from nanovllm.v1.spec_decode.eagle3_proposer import Eagle3Proposer
 from nanovllm.v1.spec_decode.ngram_proposer import NgramProposer
+from nanovllm.v1.spec_decode.types import (
+    DraftProposal,
+    SpecDecodeResult,
+    SpecReservation,
+)
+from nanovllm.v1.sample.rejection_sampler import RejectionSampler
 
 
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
+        self.speculative_config = self.config.speculative_config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -34,15 +45,41 @@ class ModelRunner:
         self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.speculative_config = config.speculative_config
-        if self.speculative_config is not None:
-            self.drafter = NgramProposer(
-                prompt_lookup_min=self.speculative_config.prompt_lookup_min,
-                prompt_lookup_max=self.speculative_config.prompt_lookup_max,
-                num_speculative_tokens=self.speculative_config.num_speculative_tokens,
-                max_model_len=config.max_model_len,
-                max_num_seqs=config.max_num_seqs,
-            )
+        self._spec_timing_use_cuda = True
+        self._initialize_spec_decode_timings()
+        self.eagle3_proposer = None
+        self.draft_model = None
+        self.draft_load_report = None
+        # spec_decoding
+        if self.speculative_config:
+            if self.speculative_config.method == "ngram":
+                self.drafter = NgramProposer(
+                    prompt_lookup_min=self.speculative_config.prompt_lookup_min,
+                    prompt_lookup_max=self.speculative_config.prompt_lookup_max,
+                    num_speculative_tokens=self.speculative_config.num_speculative_tokens,
+                    max_model_len=config.max_model_len,
+                    max_num_seqs=config.max_num_seqs
+                )
+            elif self.speculative_config.method == "eagle3":
+                draft_config = self.speculative_config.draft_hf_config
+                draft_path = self.speculative_config.draft_model
+                if draft_config is None or draft_path is None:
+                    raise ValueError("EAGLE3 draft configuration is incomplete")
+                target_embedding = self.model.model.embed_tokens
+                self.draft_model = Qwen3Eagle3ForCausalLM(
+                    draft_config,
+                    target_embedding,
+                )
+                self.draft_load_report = load_eagle3_weights(
+                    self.draft_model,
+                    draft_path,
+                    target_embedding,
+                )
+                self.eagle3_proposer = Eagle3Proposer(
+                    self.draft_model,
+                    self.block_size,
+                )
+                self.drafter = self.eagle3_proposer
             self.rejection_sampler = RejectionSampler(self.sampler)
         self.warmup_model()
         self.allocate_kv_cache()
@@ -105,13 +142,73 @@ class ModelRunner:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
         max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        seq_len = min(max_num_batched_tokens, max_model_len)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
-        for seq in seqs:
-            seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
+        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "eagle3"
+        ):
+            self.run_eagle3_prefill(seqs)
+            self._warmup_eagle3_draft_step(seqs)
+            self.release_eagle_states([seq.seq_id for seq in seqs])
+        else:
+            self.run(seqs, True)
         torch.cuda.empty_cache()
+
+    def _warmup_eagle3_draft_step(self, seqs: list[Sequence]) -> None:
+        if self.eagle3_proposer is None or self.draft_model is None:
+            raise RuntimeError("EAGLE3 draft model is not initialized")
+        anchors = [
+            self.eagle3_proposer.states[seq.seq_id].anchor_hidden_states
+            for seq in seqs
+        ]
+        device = anchors[0].device
+        batch_size = len(seqs)
+        input_ids = torch.tensor(
+            [seq.last_token for seq in seqs],
+            dtype=torch.long,
+            device=device,
+        )
+        positions = torch.tensor(
+            [
+                self.eagle3_proposer.states[
+                    seq.seq_id
+                ].draft_num_computed_tokens
+                for seq in seqs
+            ],
+            dtype=torch.long,
+            device=device,
+        )
+        cu_seqlens = torch.arange(
+            batch_size + 1,
+            dtype=torch.int32,
+            device=device,
+        )
+        set_context(
+            True,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_k=1,
+            slot_mapping=torch.full(
+                (batch_size,),
+                -1,
+                dtype=torch.int32,
+                device=device,
+            ),
+        )
+        try:
+            fused_hidden = self.draft_model.combine_hidden_states(
+                torch.stack(anchors)
+            )
+            logits_hidden, _ = self.draft_model(
+                input_ids,
+                positions,
+                fused_hidden,
+            )
+            self.draft_model.compute_logits(logits_hidden)
+        finally:
+            reset_context()
 
     def allocate_kv_cache(self):
         config = self.config
@@ -121,21 +218,81 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = max(1, hf_config.num_key_value_heads // self.world_size)
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        head_dim = getattr(
+            hf_config,
+            "head_dim",
+            hf_config.hidden_size // hf_config.num_attention_heads,
+        )
+        block_bytes = (
+            2
+            * hf_config.num_hidden_layers
+            * self.block_size
+            * num_kv_heads
+            * head_dim
+            * hf_config.dtype.itemsize
+        )
+        if self.draft_model is not None:
+            draft_config = self.speculative_config.draft_hf_config
+            draft_num_kv_heads = max(
+                1,
+                draft_config.num_key_value_heads // self.world_size,
+            )
+            draft_head_dim = getattr(
+                draft_config,
+                "head_dim",
+                draft_config.hidden_size // draft_config.num_attention_heads,
+            )
+            block_bytes += (
+                2
+                * draft_config.num_hidden_layers
+                * self.block_size
+                * draft_num_kv_heads
+                * draft_head_dim
+                * draft_config.dtype.itemsize
+            )
+        available_bytes = int(
+            total * config.gpu_memory_utilization - used - peak + current
+        )
+        config.num_kvcache_blocks = available_bytes // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+        self.kv_cache = torch.empty(
+            2,
+            hf_config.num_hidden_layers,
+            config.num_kvcache_blocks,
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+        )
+        self._attach_kv_cache(self.model, self.kv_cache)
+        if self.draft_model is not None:
+            self.draft_kv_cache = torch.empty(
+                2,
+                draft_config.num_hidden_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                draft_num_kv_heads,
+                draft_head_dim,
+            )
+            self._attach_kv_cache(self.draft_model, self.draft_kv_cache)
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+    @staticmethod
+    def _attach_kv_cache(model, kv_cache: torch.Tensor) -> None:
+        attention_modules = [
+            module
+            for module in model.modules()
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache")
+        ]
+        if len(attention_modules) != kv_cache.size(1):
+            raise ValueError(
+                "KV cache layer count does not match model attention layers"
+            )
+        for layer_id, module in enumerate(attention_modules):
+            module.k_cache = kv_cache[0, layer_id]
+            module.v_cache = kv_cache[1, layer_id]
+
+    def prepare_block_tables(self, block_tables_list: list[list[int]]):
+        max_len = max(len(block_table) for block_table in block_tables_list)
+        block_tables = [block_table + [-1] * (max_len - len(block_table)) for block_table in block_tables_list]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -149,31 +306,26 @@ class ModelRunner:
         slot_mapping = []
         block_tables = None
         for seq in seqs:
-            start = seq.num_cached_tokens
-            seqlen_q = seq.num_scheduled_tokens
-            end = start + seqlen_q
-            seqlen_k = end
-            input_ids.extend(seq[start:end])
-            positions.extend(range(start, end))
+            seqlen = len(seq)
+            input_ids.extend(seq[seq.num_cached_tokens:])
+            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+            seqlen_q = seqlen - seq.num_cached_tokens
+            seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
+            for i in range(seq.num_cached_blocks, seq.num_blocks):
+                start = seq.block_table[i] * self.block_size
+                if i != seq.num_blocks - 1:
+                    end = start + self.block_size
                 else:
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
+                    end = start + seq.last_block_num_tokens 
+                slot_mapping.extend(list(range(start, end)))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+            block_tables = self.prepare_block_tables([seq.block_table for seq in seqs])
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -196,35 +348,57 @@ class ModelRunner:
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self.prepare_block_tables([seq.block_table for seq in seqs])
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
-        temperatures = [seq.temperature for seq in seqs]
+        temperatures = []
+        for seq in seqs:
+            temperatures.append(seq.temperature)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
-    def propose_draft_token_ids(self, seqs: list[Sequence]) -> list[list[int]]:
-        if self.speculative_config is None:
-            raise RuntimeError("Speculative decoding is not configured")
+    def propose_draft_token_ids(
+        self,
+        seqs: list[Sequence],
+    ) -> list[list[int]]:
+        num_seqs = len(seqs)
         max_model_len = self.config.max_model_len
-        num_tokens_no_spec = np.empty(len(seqs), dtype=np.int32)
-        token_ids_cpu = np.zeros((len(seqs), max_model_len), dtype=np.int32)
-        for index, seq in enumerate(seqs):
+        num_tokens_no_spec = np.empty((num_seqs,), dtype=np.int32)
+        token_ids_cpu = np.zeros((num_seqs, max_model_len), dtype=np.int32)
+        for i, seq in enumerate(seqs):
             seq_len = min(len(seq), max_model_len)
-            num_tokens_no_spec[index] = seq_len
-            token_ids_cpu[index, :seq_len] = np.asarray(
-                seq.token_ids[:seq_len], dtype=np.int32
+            num_tokens_no_spec[i] = seq_len
+            if seq_len > 0:
+                token_ids_cpu[i, :seq_len] = np.asarray(seq.token_ids[:seq_len], dtype=np.int32)
+
+        spec_config = self.speculative_config
+        if spec_config.method == "ngram":
+            assert isinstance(self.drafter, NgramProposer)
+            draft_token_ids = self.drafter.propose(
+                num_tokens_no_spec=num_tokens_no_spec,
+                token_ids_cpu=token_ids_cpu,
             )
-        return self.drafter.propose(num_tokens_no_spec, token_ids_cpu)
+        else:
+            raise ValueError(f"Unsupported speculative decoding method: {spec_config.method}")
+        return draft_token_ids
 
     def prepare_spec_decode(
         self,
         seqs: list[Sequence],
         draft_token_ids: list[list[int]],
-        reservations: list[dict[str, list[int] | int]],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        reservations: list[SpecReservation | dict[str, list[int] | int]],
+        include_query_lengths: bool = False,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int]]
+    ):
+        """
+            reservations: seq在speculative decoding阶段的临时KV cache预留记录
+                          e.g. {"draft_len": 4, "new_block_ids": [37]}
+        """
+        
         input_ids: list[int] = []
         positions: list[int] = []
         draft_row_indices: list[int] = []
@@ -233,19 +407,26 @@ class ModelRunner:
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
+        offset = 0
         slot_mapping: list[int] = []
         block_tables_list: list[list[int]] = []
-        offset = 0
-        for seq, seq_draft_token_ids, reservation in zip(
-            seqs, draft_token_ids, reservations
-        ):
+        query_lengths: list[int] = []
+        for seq, seq_draft_token_ids, reservation in zip(seqs, draft_token_ids, reservations):
             seq_start_pos = seq.num_computed_tokens
-            seq_total_len = len(seq) + len(seq_draft_token_ids)
+            seq_len = len(seq)
+            seq_total_len = seq_len + len(seq_draft_token_ids)
             seq_input_ids = seq.token_ids[seq_start_pos:] + seq_draft_token_ids
+            num_drafts = len(seq_draft_token_ids)
             q_len = len(seq_input_ids)
-            if q_len == 0:
-                raise RuntimeError("Speculative decode requires an uncomputed token")
-            block_table = seq.block_table + reservation["new_block_ids"]
+            new_block_ids = (
+                reservation.new_block_ids
+                if isinstance(reservation, SpecReservation)
+                else reservation["new_block_ids"]
+            )
+            assert isinstance(new_block_ids, list)
+            block_table = seq.block_table + new_block_ids
+            query_lengths.append(q_len)
+
             input_ids.extend(seq_input_ids)
             positions.extend(range(seq_start_pos, seq_total_len))
             cu_seqlens_q.append(cu_seqlens_q[-1] + q_len)
@@ -253,85 +434,258 @@ class ModelRunner:
             max_seqlen_q = max(max_seqlen_q, q_len)
             max_seqlen_k = max(max_seqlen_k, seq_total_len)
             block_tables_list.append(block_table)
-            for position in range(seq_start_pos, seq_total_len):
-                block_id = block_table[position // self.block_size]
-                slot_mapping.append(block_id * self.block_size + position % self.block_size)
 
-            num_drafts = len(seq_draft_token_ids)
+            for pos in range(seq_start_pos, seq_total_len):
+                block_id = block_table[pos // self.block_size]
+                slot_mapping.append(block_id * self.block_size + pos % self.block_size)
+
             draft_start = q_len - num_drafts - 1
-            if num_drafts:
+            if num_drafts > 0:
                 draft_row_indices.extend(
                     range(offset + draft_start, offset + draft_start + num_drafts)
                 )
             bonus_row_indices.append(offset + q_len - 1)
             offset += q_len
 
-        input_ids_tensor = torch.tensor(
-            input_ids, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
-        positions_tensor = torch.tensor(
-            positions, dtype=torch.int64, pin_memory=True
-        ).cuda(non_blocking=True)
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions_tensor = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         verify_row_indices = torch.tensor(
             draft_row_indices + bonus_row_indices,
             dtype=torch.int64,
             pin_memory=True,
         ).cuda(non_blocking=True)
-        cu_seqlens_q_tensor = torch.tensor(
-            cu_seqlens_q, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        cu_seqlens_k_tensor = torch.tensor(
-            cu_seqlens_k, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
-        slot_mapping_tensor = torch.tensor(
-            slot_mapping, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+        cu_seqlens_q_tensor = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k_tensor = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping_tensor = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables(block_tables_list)
         set_context(
             True,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
-            max_seqlen_q,
-            max_seqlen_k,
-            slot_mapping_tensor,
-            None,
-            self.prepare_block_tables_from_lists(block_tables_list),
+            cu_seqlens_q=cu_seqlens_q_tensor,
+            cu_seqlens_k=cu_seqlens_k_tensor,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            slot_mapping=slot_mapping_tensor,
+            block_tables=block_tables,
         )
-        return input_ids_tensor, positions_tensor, verify_row_indices
+        prepared = (input_ids_tensor, positions_tensor, verify_row_indices)
+        if include_query_lengths:
+            return (*prepared, query_lengths)
+        return prepared
 
-    def prepare_block_tables_from_lists(self, block_tables_list: list[list[int]]):
-        max_len = max(len(block_table) for block_table in block_tables_list)
-        block_tables = [
-            block_table + [-1] * (max_len - len(block_table))
-            for block_table in block_tables_list
-        ]
-        return torch.tensor(
-            block_tables, dtype=torch.int32, pin_memory=True
-        ).cuda(non_blocking=True)
+    def verify_draft_token_ids(
+        self,
+        draft_token_ids: list[list[int]],
+        verify_logits: torch.Tensor,
+        temperatures: torch.Tensor | None,
+    ) -> SpecDecodeResult | None:
+        if self.rank != 0:
+            return None
+
+        assert temperatures is not None
+        # 前一部分是requests的draft_token数, 后一部分是requests的bonus_token数
+        expected_rows = sum(len(x) for x in draft_token_ids) + len(draft_token_ids)
+        if verify_logits.ndim != 2 or verify_logits.size(0) != expected_rows:
+            raise ValueError(
+                f"verify_logits must have shape [{expected_rows}, vocab_size], "
+                f"got {tuple(verify_logits.shape)}"
+            )
+        sampled_verify_token_ids = self.rejection_sampler(
+            draft_token_ids=draft_token_ids,
+            logits=verify_logits,
+            temperatures=temperatures,
+        )
+        return sampled_verify_token_ids
 
     def run_spec_decode(
         self,
         seqs: list[Sequence],
         draft_token_ids: list[list[int]],
         reservations: list[dict[str, list[int] | int]],
-    ) -> list[list[int]] | None:
+    ) -> SpecDecodeResult | None:
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        input_ids, positions, verify_row_indices = self.prepare_spec_decode(
-            seqs, draft_token_ids, reservations
-        )
+        verify_started = self._begin_spec_timing()
+        input_ids, positions, verify_row_indices = self.prepare_spec_decode(seqs, draft_token_ids, reservations)
+        
         verify_logits = self.run_model(
             input_ids,
             positions,
             is_prefill=True,
             spec_row_indices=verify_row_indices,
         )
-        token_ids = (
-            self.rejection_sampler(draft_token_ids, verify_logits, temperatures)
-            if self.rank == 0
-            else None
+        self._finish_spec_timing("verify", verify_started)
+        sampling_started = self._begin_spec_timing()
+        verified_token_ids = self.verify_draft_token_ids(
+            draft_token_ids=draft_token_ids,
+            verify_logits=verify_logits,
+            temperatures=temperatures,
         )
+        self._finish_spec_timing("sampling", sampling_started)
         reset_context()
-        return token_ids
+        return verified_token_ids
 
+    def run_eagle3_prefill(self, seqs: list[Sequence]) -> list[int] | None:
+        if self.eagle3_proposer is None:
+            raise RuntimeError("EAGLE3 proposer is not initialized")
+        input_ids, positions = self.prepare_prefill(seqs)
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        try:
+            target_output = self.model(
+                input_ids,
+                positions,
+                self.speculative_config.auxiliary_layer_ids,
+            )
+            if not isinstance(target_output, TargetModelOutput):
+                raise TypeError("target model did not return auxiliary hidden states")
+            logits = self.model.compute_logits(target_output.hidden_states)
+            auxiliary_rows = list(
+                target_output.auxiliary_hidden_states.split(
+                    [len(seq) for seq in seqs],
+                    dim=0,
+                )
+            )
+        finally:
+            reset_context()
+
+        self.eagle3_proposer.prefill(
+            seqs,
+            auxiliary_rows,
+            [len(seq) for seq in seqs],
+        )
+        if self.rank != 0:
+            return None
+        assert temperatures is not None
+        return self.sampler(logits, temperatures).tolist()
+
+    def run_eagle3_spec_decode(
+        self,
+        seqs: list[Sequence],
+        reservations: list[SpecReservation],
+    ) -> tuple[DraftProposal, SpecDecodeResult] | None:
+        if self.eagle3_proposer is None:
+            raise RuntimeError("EAGLE3 proposer is not initialized")
+        if len(reservations) != len(seqs):
+            raise ValueError("EAGLE3 reservation batch size mismatch")
+        temperatures = self.prepare_sample(seqs)
+        draft_started = self._begin_spec_timing()
+        proposal = self.eagle3_proposer.propose(
+            seqs,
+            reservations,
+            temperatures,
+        )
+        self._finish_spec_timing("draft", draft_started)
+        verify_started = self._begin_spec_timing()
+        prepared = self.prepare_spec_decode(
+            seqs,
+            proposal.token_ids,
+            reservations,
+            include_query_lengths=True,
+        )
+        input_ids, positions, verify_row_indices, query_lengths = prepared
+        try:
+            target_output = self.model(
+                input_ids,
+                positions,
+                self.speculative_config.auxiliary_layer_ids,
+            )
+            if not isinstance(target_output, TargetModelOutput):
+                raise TypeError("target model did not return auxiliary hidden states")
+            verification_hidden = target_output.hidden_states.index_select(
+                0,
+                verify_row_indices,
+            )
+            verification_logits = self.model.lm_head(
+                verification_hidden,
+                return_all_logits=True,
+            )
+            verification_auxiliary = list(
+                target_output.auxiliary_hidden_states.split(
+                    query_lengths,
+                    dim=0,
+                )
+            )
+        finally:
+            reset_context()
+        self._finish_spec_timing("verify", verify_started)
+
+        sampling_started = self._begin_spec_timing()
+        result = self.rejection_sampler(
+            draft_token_ids=proposal.token_ids,
+            logits=verification_logits,
+            temperatures=temperatures,
+            draft_probs=proposal.probabilities,
+        )
+        self.eagle3_proposer.commit(
+            seqs,
+            verification_auxiliary,
+            result.accepted_draft_counts,
+            [
+                len(seq) + accepted_count
+                for seq, accepted_count in zip(
+                    seqs,
+                    result.accepted_draft_counts,
+                )
+            ],
+        )
+        self._finish_spec_timing("sampling", sampling_started)
+        return proposal, result
+
+    def release_eagle_states(self, seq_ids: list[int]) -> None:
+        if self.eagle3_proposer is not None:
+            self.eagle3_proposer.release(seq_ids)
+
+    def _initialize_spec_decode_timings(self) -> None:
+        self._spec_time_ms = {
+            "draft": 0.0,
+            "verify": 0.0,
+            "sampling": 0.0,
+        }
+        self._spec_time_events = {
+            "draft": [],
+            "verify": [],
+            "sampling": [],
+        }
+
+    def _begin_spec_timing(self):
+        if not hasattr(self, "_spec_time_ms"):
+            self._initialize_spec_decode_timings()
+        if getattr(self, "_spec_timing_use_cuda", False):
+            started = torch.cuda.Event(enable_timing=True)
+            started.record()
+            return started
+        return perf_counter()
+
+    def _finish_spec_timing(self, phase: str, started) -> None:
+        if isinstance(started, torch.cuda.Event):
+            finished = torch.cuda.Event(enable_timing=True)
+            finished.record()
+            self._spec_time_events[phase].append((started, finished))
+        else:
+            self._spec_time_ms[phase] += (perf_counter() - started) * 1000
+
+    def _resolve_spec_timing_events(self) -> None:
+        if not any(self._spec_time_events.values()):
+            return
+        torch.cuda.synchronize()
+        for phase, events in self._spec_time_events.items():
+            self._spec_time_ms[phase] += sum(
+                started.elapsed_time(finished)
+                for started, finished in events
+            )
+            events.clear()
+
+    def get_spec_decode_timings(self) -> tuple[float, float, float]:
+        if not hasattr(self, "_spec_time_ms"):
+            self._initialize_spec_decode_timings()
+        self._resolve_spec_timing_events()
+        return (
+            self._spec_time_ms["draft"],
+            self._spec_time_ms["verify"],
+            self._spec_time_ms["sampling"],
+        )
+
+    def reset_spec_decode_metrics(self) -> None:
+        self._initialize_spec_decode_timings()
+    
     @torch.inference_mode()
     def run_model(
         self,
@@ -339,14 +693,13 @@ class ModelRunner:
         positions: torch.Tensor,
         is_prefill: bool,
         spec_row_indices: torch.Tensor | None = None,
-    ):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+    ): 
+        if is_prefill and spec_row_indices is not None:
             hidden_states = self.model(input_ids, positions)
-            if spec_row_indices is not None:
-                return self.model.compute_logits(
-                    hidden_states, return_all_logits=True
-                )[spec_row_indices]
-            return self.model.compute_logits(hidden_states)
+            hidden_states = hidden_states.index_select(0, spec_row_indices)
+            return self.model.lm_head(hidden_states, return_all_logits=True)
+        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
@@ -362,7 +715,7 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int] | list[list[int]]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)

@@ -9,10 +9,10 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
+from nanovllm.models.model_output import TargetModelOutput
 
 
 class Qwen3Attention(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -23,7 +23,7 @@ class Qwen3Attention(nn.Module):
         rms_norm_eps: float = 1e-06,
         qkv_bias: bool = False,
         rope_theta: float = 10000,
-        rope_scaling: dict | None = None,
+        rope_scaling: tuple | None = None,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
@@ -51,13 +51,12 @@ class Qwen3Attention(nn.Module):
             hidden_size,
             bias=False,
         )
-        if isinstance(rope_scaling, dict):
-            rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
+            rope_scaling=rope_scaling,
         )
         self.attn = Attention(
             self.num_heads,
@@ -174,13 +173,30 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+        auxiliary_layer_ids: tuple[int, ...] = (),
+    ) -> torch.Tensor | TargetModelOutput:
+        if tuple(sorted(set(auxiliary_layer_ids))) != tuple(auxiliary_layer_ids):
+            raise ValueError("auxiliary_layer_ids must be sorted and unique")
+        if auxiliary_layer_ids and (
+            auxiliary_layer_ids[0] < 0
+            or auxiliary_layer_ids[-1] >= len(self.layers)
+        ):
+            raise ValueError("auxiliary layer index out of range")
+
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        auxiliary_hidden_states = []
+        for layer_idx, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if layer_idx in auxiliary_layer_ids:
+                auxiliary_hidden_states.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if not auxiliary_layer_ids:
+            return hidden_states
+        return TargetModelOutput(
+            hidden_states=hidden_states,
+            auxiliary_hidden_states=torch.cat(auxiliary_hidden_states, dim=-1),
+        )
 
 
 class Qwen3ForCausalLM(nn.Module):
@@ -206,12 +222,12 @@ class Qwen3ForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
-        return self.model(input_ids, positions)
+        auxiliary_layer_ids: tuple[int, ...] = (),
+    ) -> torch.Tensor | TargetModelOutput:
+        return self.model(input_ids, positions, auxiliary_layer_ids)
 
     def compute_logits(
         self,
         hidden_states: torch.Tensor,
-        return_all_logits: bool = False,
     ) -> torch.Tensor:
-        return self.lm_head(hidden_states, return_all_logits=return_all_logits)
+        return self.lm_head(hidden_states)

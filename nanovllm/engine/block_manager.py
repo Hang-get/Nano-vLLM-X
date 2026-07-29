@@ -25,7 +25,13 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int,
+        enable_prefix_cache: bool = True,
+    ):
+        self.enable_prefix_cache = enable_prefix_cache
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
@@ -40,56 +46,75 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
-    def _allocate_block(self) -> int:
-        block_id = self.free_block_ids.popleft()
+    def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]
         assert block.ref_count == 0
-        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
-            del self.hash_to_block_id[block.hash]
         block.reset()
+        self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
-        return block_id
+        return self.blocks[block_id]
 
-    def _deallocate_block(self, block_id: int):
+    def _deallocate_block(self, block_id: int) -> Block:
         assert self.blocks[block_id].ref_count == 0
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    def can_allocate(self, seq: Sequence) -> int:
+    def _finalize_computed_blocks(self, seq: Sequence, num_computed_tokens: int):
+        if not self.enable_prefix_cache:
+            return
+        num_full_blocks = num_computed_tokens // self.block_size
+        for block_idx in range(num_full_blocks):
+            self._finalize_one_block(seq, block_idx)
+
+    def _finalize_one_block(self, seq: Sequence, block_idx: int):
+        block_id = seq.block_table[block_idx]
+        block = self.blocks[block_id]
+        if block.hash != -1:
+            return
+        token_ids = seq.block(block_idx)
+        prefix = (
+            self.blocks[seq.block_table[block_idx - 1]].hash
+            if block_idx > 0
+            else -1
+        )
+        block_hash = self.compute_hash(token_ids, prefix)
+        block.update(block_hash, token_ids)
+        self.hash_to_block_id[block_hash] = block_id
+
+    def can_allocate(self, seq: Sequence) -> bool:
+        return len(self.free_block_ids) >= seq.num_blocks
+
+    def allocate(self, seq: Sequence):
+        assert not seq.block_table
+        if not self.enable_prefix_cache:
+            for _ in range(seq.num_blocks):
+                block_id = self.free_block_ids[0]
+                self._allocate_block(block_id)
+                seq.block_table.append(block_id)
+            return
+
         h = -1
-        num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
+        cache_miss = False
+        for i in range(seq.num_blocks):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
+            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                break
-            num_cached_blocks += 1
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
-            return -1
-        return num_cached_blocks
-
-    def allocate(self, seq: Sequence, num_cached_blocks: int):
-        assert not seq.block_table
-        h = -1
-        for i in range(num_cached_blocks):
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block_id = self.hash_to_block_id[h]
-            block = self.blocks[block_id]
-            if block_id in self.used_block_ids:
-                block.ref_count += 1
+                cache_miss = True
+            if cache_miss:
+                block_id = self.free_block_ids[0]
+                block = self._allocate_block(block_id)
             else:
-                block.ref_count = 1
-                self.free_block_ids.remove(block_id)
-                self.used_block_ids.add(block_id)
+                seq.num_cached_tokens += self.block_size
+                if block_id in self.used_block_ids:
+                    block = self.blocks[block_id]
+                    block.ref_count += 1
+                else:
+                    block = self._allocate_block(block_id)
+            if h != -1:
+                block.update(h, token_ids)
+                self.hash_to_block_id[h] = block_id
             seq.block_table.append(block_id)
-        for i in range(num_cached_blocks, seq.num_blocks):
-            seq.block_table.append(self._allocate_block())
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -98,23 +123,67 @@ class BlockManager:
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
+        seq.num_computed_tokens = 0
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
+        block_table = seq.block_table
+        last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
-            seq.block_table.append(self._allocate_block())
+            if self.enable_prefix_cache:
+                assert last_block.hash != -1
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            block_table.append(block_id)
+        elif len(seq) % self.block_size == 0:
+            if not self.enable_prefix_cache:
+                return
+            assert last_block.hash == -1
+            token_ids = seq.block(seq.num_blocks-1)
+            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+            h = self.compute_hash(token_ids, prefix)
+            last_block.update(h, token_ids)
+            self.hash_to_block_id[h] = last_block.block_id
+        elif self.enable_prefix_cache:
+            assert last_block.hash == -1
 
-    def hash_blocks(self, seq: Sequence):
-        start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
-        if start == end: return
-        h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
-        for i in range(start, end):
-            block = self.blocks[seq.block_table[i]]
-            token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h)
-            block.update(h, token_ids)
-            self.hash_to_block_id[h] = block.block_id
+    def get_num_appendable_tokens(self, seq: Sequence) -> int:
+        """该序列seq理论上最多能再追加多少个token"""
+        covered_tokens = len(seq.block_table) * self.block_size
+        return covered_tokens - len(seq) + len(self.free_block_ids) * self.block_size
+
+    def reserve_spec_append(self, seq: Sequence, num_tokens: int) -> list[int]:
+        num_required_blocks = (len(seq) + num_tokens + self.block_size - 1) // self.block_size - len(seq.block_table)
+        if num_required_blocks <= 0:
+            return []
+        if len(self.free_block_ids) < num_required_blocks:
+            raise RuntimeError("Insufficient KV cache capacity for speculative reservation.")
+
+        new_block_ids: list[int] = []
+        for _ in range(num_required_blocks):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            new_block_ids.append(block_id)
+        return new_block_ids
+
+    def commit_spec_append(
+        self,
+        seq: Sequence,
+        new_block_ids: list[int],
+        num_computed_tokens: int,
+    ):
+        old_num_blocks = len(seq.block_table)
+        required_num_blocks = (num_computed_tokens + self.block_size - 1) // self.block_size
+        num_keep_blocks = max(0, required_num_blocks - old_num_blocks)
+        seq.block_table.extend(new_block_ids[:num_keep_blocks])
+
+        for block_id in new_block_ids[num_keep_blocks:]:
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
+        self._finalize_computed_blocks(seq, num_computed_tokens)

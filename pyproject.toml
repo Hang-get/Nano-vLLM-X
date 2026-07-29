@@ -1,28 +1,48 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=69", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "nano-vllm"
-version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
-license = "MIT"
-license-files = ["LICENSE"]
+name = "nano-vllm-ms2"
+version = "0.1.0"
+description = "A lightweight vLLM implementation with Qwen3-MoE and speculative decoding support."
 readme = "README.md"
-description = "a lightweight vLLM implementation built from scratch"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.12,<3.13"
+license = { file = "LICENSE" }
+authors = [
+    { name = "banfeb" },
+]
+
 dependencies = [
-    "torch>=2.4.0",
-    "triton>=3.0.0",
-    "transformers>=4.51.0",
-    "flash-attn",
-    "xxhash",
+    "torch>=2.5.0",
+    "transformers>=5.2.0",
+    "flash-attn>=2.7.4.post1",
+    "triton>=3.1.0",
+    "numpy>=2.4.2",
+    "tqdm>=4.67.3",
+    "safetensors>=0.7.0",
+    "xxhash>=3.6.0",
     "numba>=0.65.0",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.3,<9",
+]
+
 [project.urls]
-Homepage="https://github.com/GeeeekExplorer/nano-vllm"
+Homepage = "https://github.com/banfeb/nano-vLLM-MS2"
+Repository = "https://github.com/banfeb/nano-vLLM-MS2.git"
+
+[tool.setuptools]
+include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["."]
 include = ["nanovllm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "cuda: requires a CUDA device and installed GPU kernels",
+    "model_weights: requires local target and draft checkpoint directories",
+]

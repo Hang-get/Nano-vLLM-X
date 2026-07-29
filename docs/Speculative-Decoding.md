@@ -1,28 +1,73 @@
 # Speculative Decoding
 
-N-gram speculative decoding accelerates target-model generation by proposing a
-short continuation from repeated token patterns in the existing context. The
-target model verifies the proposal in a single forward pass.
+nano-vLLM-MS2 supports N-gram prompt lookup and a linear EAGLE3 path. Both
+methods keep target-model sampling authoritative. EAGLE3 additionally uses
+draft probabilities and exact rejection sampling, so accepted drafts plus the
+recovery or bonus token follow the target distribution.
 
-## N-gram Flow
+## EAGLE3 Model Pair
 
-1. `NgramProposer` searches each sequence for its longest repeated suffix and
-   proposes up to `num_speculative_tokens` continuation tokens.
-2. The model runner evaluates all proposal positions plus one bonus position
-   for every request.
-3. `RejectionSampler` accepts the longest valid draft prefix. On the first
-   rejection it samples a replacement token; when all draft tokens are accepted
-   it appends the bonus token.
-4. The scheduler commits KV-cache blocks only for accepted draft tokens and
-   releases unused reservations.
+The first supported pair is fixed deliberately:
 
-## Configuration
+- Target: `Qwen/Qwen3-4B-Instruct-2507`
+- Draft: `andyjjrt/Qwen3-4B-Instruct-2507-Eagle3`
+- Draft revision: `408d111ec6cde42f2784f50cd14189d626a6eae4`
+- Target auxiliary layers: `(2, 18, 33)`
+
+Download both checkpoints to local directories. Runtime loading does not fetch
+weights or a draft tokenizer. The target tokenizer is used for both models.
+
+## EAGLE3 Usage
 
 ```python
-from nanovllm import LLM
+from nanovllm import LLM, SamplingParams
+
+target_model_path = "/models/Qwen3-4B-Instruct-2507"
+draft_model_path = "/models/Qwen3-4B-Instruct-2507-Eagle3"
 
 llm = LLM(
-    "/YOUR/MODEL/PATH",
+    target_model_path,
+    enforce_eager=True,
+    tensor_parallel_size=1,
+    max_model_len=2048,
+    speculative_config={
+        "method": "eagle3",
+        "draft_model": draft_model_path,
+        "num_speculative_tokens": 5,
+    },
+)
+
+outputs = llm.generate(
+    ["Explain speculative decoding."],
+    SamplingParams(temperature=0.8, max_tokens=128),
+)
+print(outputs[0]["text"])
+print(llm.spec_decode_metrics)
+```
+
+EAGLE3 validates the exact checkpoint architecture, dimensions, vocabulary,
+dtype, and token IDs before allocating CUDA memory. Incompatible checkpoints
+fail with a field-specific error.
+
+## Current EAGLE3 Limits
+
+- One GPU and `tensor_parallel_size == 1`.
+- Eager execution only: `enforce_eager=True`.
+- Maximum context length of 2048 tokens.
+- Prefix caching is disabled.
+- Fixed-length linear proposals only.
+- No dynamic candidate tree, tree attention, tensor parallelism, or CUDA graph.
+
+The target and draft use the same logical block IDs but separate physical KV
+tensors. KV capacity is computed from the combined bytes per target and draft
+block.
+
+## N-gram Usage
+
+```python
+llm = LLM(
+    target_model_path,
+    enforce_eager=True,
     speculative_config={
         "method": "ngram",
         "num_speculative_tokens": 3,
@@ -32,11 +77,46 @@ llm = LLM(
 )
 ```
 
-`prompt_lookup_min` and `prompt_lookup_max` define the repeated n-gram range.
-The engine falls back to a normal target-model token whenever no continuation
-can be proposed.
+N-gram proposals remain deterministic and do not provide draft probabilities.
+The rejection sampler preserves this existing behavior while returning explicit
+accepted counts.
 
 ## Metrics
 
-`LLM.acceptance_rate` reports accepted draft tokens divided by proposed draft
-tokens. Call `LLM.reset_spec_decode_metrics()` before a measured run.
+`llm.spec_decode_metrics` returns an immutable snapshot with:
+
+- proposed and accepted draft-token counts;
+- mean effective draft length per speculative request;
+- zero-draft fallback count;
+- cumulative draft, target verification, and sampling time in milliseconds.
+
+`llm.acceptance_rate` remains available. The pending root token is sampled by
+the target and is excluded from proposed and accepted draft counts.
+
+## Verification And Benchmarking
+
+CPU checks:
+
+```powershell
+py -3.12 -m pytest tests -q -m "not cuda and not model_weights"
+```
+
+CUDA and local-checkpoint checks:
+
+```powershell
+$env:NANOVLLM_TARGET_MODEL='D:\models\Qwen3-4B-Instruct-2507'
+$env:NANOVLLM_EAGLE3_MODEL='D:\models\Qwen3-4B-Instruct-2507-Eagle3'
+py -3.12 -m pytest tests/integration/test_eagle3_qwen3_4b.py -q -m "cuda and model_weights"
+```
+
+Benchmark target-only and EAGLE3 with identical prompts and sampling settings:
+
+```powershell
+py -3.12 bench_eagle3.py `
+  --target-model $env:NANOVLLM_TARGET_MODEL `
+  --draft-model $env:NANOVLLM_EAGLE3_MODEL
+```
+
+Performance numbers are valid only when reported with the command, checkpoint
+revision, software versions, and named GPU hardware. This repository does not
+claim EAGLE3 speedups without running `bench_eagle3.py` in that environment.
