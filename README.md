@@ -57,10 +57,24 @@ outputs[0]["text"]
 
 ## Benchmark
 
-See `bench.py` for benchmark.
+Use `bench.py` to compare target-only decoding with N-gram speculative decoding:
 
-The benchmark enables N-gram speculative decoding and reports the draft-token
-acceptance rate. Omit `speculative_config` to use standard decoding.
+```powershell
+py -3.12 bench.py --model D:\models\Qwen3-0.6B
+```
+
+Use `bench_eagle3.py` to compare target-only decoding with EAGLE3:
+
+```powershell
+py -3.12 bench_eagle3.py `
+  --target-model D:\models\Qwen3-4B-Instruct-2507 `
+  --draft-model D:\models\Qwen3-4B-Instruct-2507-Eagle3
+```
+
+Both scripts emit JSON with end-to-end throughput, throughput speedup, TTFT,
+completion latency, TPOT, acceptance rate, draft proposal and acceptance
+counts, effective draft length, fallback count, and draft/verification/sampling
+time attribution.
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)

@@ -117,6 +117,19 @@ py -3.12 bench_eagle3.py `
   --draft-model $env:NANOVLLM_EAGLE3_MODEL
 ```
 
+Benchmark target-only and N-gram decoding with repeated token prompts that make
+prompt lookup measurable:
+
+```powershell
+py -3.12 bench.py --model D:\models\Qwen3-0.6B
+```
+
+Both benchmark scripts report the same JSON schema: end-to-end output
+throughput, TTFT, completion latency, TPOT, acceptance rate, proposed and
+accepted draft-token counts, effective draft length, fallback count, and the
+draft/verification/sampling time breakdown. `throughput_speedup` compares the
+speculative run directly with the target-only baseline from the same script.
+
 Performance numbers are valid only when reported with the command, checkpoint
 revision, software versions, and named GPU hardware. This repository does not
 claim EAGLE3 speedups without running `bench_eagle3.py` in that environment.

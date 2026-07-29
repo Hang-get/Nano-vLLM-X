@@ -1,12 +1,10 @@
 import argparse
-import atexit
-from dataclasses import asdict
 import json
-from time import perf_counter
 
 import torch
 
-from nanovllm import LLM, SamplingParams
+from bench_utils import run_mode, speedup
+from nanovllm import SamplingParams
 
 
 PROMPTS = [
@@ -32,56 +30,48 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_mode(args, mode):
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    speculative_config = None
-    if mode == "eagle3":
-        speculative_config = {
-            "method": "eagle3",
-            "draft_model": args.draft_model,
-            "num_speculative_tokens": args.num_speculative_tokens,
-        }
-    llm = LLM(
-        args.target_model,
-        enforce_eager=True,
-        tensor_parallel_size=1,
-        max_model_len=args.max_model_len,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        speculative_config=speculative_config,
-    )
-    try:
-        llm.reset_spec_decode_metrics()
-        sampling = SamplingParams(
-            temperature=args.temperature,
-            max_tokens=args.max_tokens,
-        )
-        started = perf_counter()
-        outputs = llm.generate(PROMPTS, sampling, use_tqdm=False)
-        elapsed = perf_counter() - started
-        output_tokens = sum(len(output["token_ids"]) for output in outputs)
-        metrics = asdict(llm.spec_decode_metrics)
-        return {
-            "mode": mode,
-            "output_tokens": output_tokens,
-            "elapsed_seconds": elapsed,
-            "throughput_tokens_per_second": output_tokens / elapsed,
-            "acceptance_rate": llm.acceptance_rate,
-            **metrics,
-        }
-    finally:
-        atexit.unregister(llm.exit)
-        llm.exit()
-        del llm
-        torch.cuda.empty_cache()
-
-
 def main():
     args = parse_args()
-    hardware = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "no CUDA"
-    results = [run_mode(args, "target_only"), run_mode(args, "eagle3")]
-    print(f"Hardware: {hardware}")
-    print(json.dumps(results, indent=2, sort_keys=True))
+    sampling = SamplingParams(
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+    )
+    base_kwargs = {
+        "enforce_eager": True,
+        "tensor_parallel_size": 1,
+        "max_model_len": args.max_model_len,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+    }
+    baseline = run_mode(
+        mode="target_only",
+        model=args.target_model,
+        prompts=PROMPTS,
+        sampling=sampling,
+        seed=args.seed,
+        llm_kwargs=base_kwargs,
+    )
+    eagle3 = run_mode(
+        mode="eagle3",
+        model=args.target_model,
+        prompts=PROMPTS,
+        sampling=sampling,
+        seed=args.seed,
+        llm_kwargs={
+            **base_kwargs,
+            "speculative_config": {
+                "method": "eagle3",
+                "draft_model": args.draft_model,
+                "num_speculative_tokens": args.num_speculative_tokens,
+            },
+        },
+    )
+    result = {
+        "hardware": torch.cuda.get_device_name(0),
+        "configuration": vars(args),
+        "throughput_speedup": speedup(baseline, eagle3),
+        "results": [baseline, eagle3],
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
