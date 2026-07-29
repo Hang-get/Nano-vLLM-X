@@ -73,7 +73,7 @@ class Qwen3MoeSparseMoeBlockOld(nn.Module):
         # 初始化输出
         final_hidden_states = torch.zeros_like(hidden_states)
 
-        # 逐 token 计算（简化循环；实际用 scatter/gather 优化）
+        # 遍历专家（简化循环；实际用 scatter/gather 优化）
         for expert_idx in range(self.n_routed_experts):
             mask = (selected_experts == expert_idx).any(dim=-1)  # [batch_seq]
             if mask.sum() == 0:
