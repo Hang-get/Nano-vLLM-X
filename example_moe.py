@@ -5,7 +5,7 @@ from transformers import AutoTokenizer
 
 def main():
 
-    path = os.path.expanduser("/root/nano-vllm-kms/models/qwen3-moe-tiny-random")
+    path = os.path.expanduser("/root/Nano-vLLM-X/models/qwen3-moe-tiny-random")
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 

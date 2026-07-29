@@ -1,6 +1,6 @@
 # Speculative Decoding
 
-nano-vLLM-MS2 supports N-gram prompt lookup and a linear EAGLE3 path. Both
+Nano-vLLM-X supports N-gram prompt lookup and a linear EAGLE3 path. Both
 methods keep target-model sampling authoritative. EAGLE3 additionally uses
 draft probabilities and exact rejection sampling, so accepted drafts plus the
 recovery or bonus token follow the target distribution.

@@ -2,13 +2,9 @@
 <img width="300" src="assets/logo.png">
 </p>
 
-<p align="center">
-<a href="https://trendshift.io/repositories/15323" target="_blank"><img src="https://trendshift.io/api/badge/repositories/15323" alt="GeeeekExplorer%2Fnano-vllm | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+# Nano-vLLM-X
 
-# Nano-vLLM
-
-A lightweight vLLM implementation built from scratch.
+Nano-vLLM-X is a lightweight vLLM implementation built from scratch.
 
 ## Key Features
 
@@ -22,7 +18,7 @@ N-gram speculative decoding is available through `speculative_config`. It uses
 Numba for prompt lookup and Triton for GPU rejection sampling.
 
 ```bash
-pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+pip install git+https://github.com/Hang-get/Nano-vLLM-X.git
 ```
 
 ## Model Download
@@ -50,7 +46,7 @@ llm = LLM(
     },
 )
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
+prompts = ["Hello, Nano-vLLM-X."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
@@ -87,9 +83,9 @@ time attribution.
 | Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
 |----------------|-------------|----------|-----------------------|
 | vLLM           | 133,966     | 98.37    | 1361.84               |
-| Nano-vLLM      | 133,966     | 93.41    | 1434.13               |
+| Nano-vLLM-X    | 133,966     | 93.41    | 1434.13               |
 
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=GeeeekExplorer/nano-vllm&type=Date)](https://www.star-history.com/#GeeeekExplorer/nano-vllm&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=Hang-get/Nano-vLLM-X&type=Date)](https://www.star-history.com/#Hang-get/Nano-vLLM-X&Date)
