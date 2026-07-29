@@ -18,6 +18,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.is_spec_decoding = config.speculative_config is not None
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -44,18 +45,40 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        seq.keep_token_ids = self.is_spec_decoding
         self.scheduler.add(seq)
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if not is_prefill and self.scheduler.is_spec_decoding:
+            draft_token_ids = self.model_runner.propose_draft_token_ids(seqs)
+            draft_token_ids, reservations = self.scheduler.reserve_spec_decode(
+                seqs, draft_token_ids
+            )
+            token_ids = self.model_runner.call(
+                "run_spec_decode", seqs, draft_token_ids, reservations
+            )
+            num_tokens = -self.scheduler.postprocess_spec_decode(
+                seqs, token_ids, draft_token_ids, reservations
+            )
+        else:
+            num_tokens = (
+                sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+            )
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
     def is_finished(self):
         return self.scheduler.is_finished()
+
+    @property
+    def acceptance_rate(self) -> float:
+        return self.scheduler.acceptance_rate
+
+    def reset_spec_decode_metrics(self):
+        self.scheduler.reset_spec_decode_metrics()
 
     def generate(
         self,

@@ -17,6 +17,7 @@ dependencies = [
     "transformers>=4.51.0",
     "flash-attn",
     "xxhash",
+    "numba>=0.65.0",
 ]
 
 [project.urls]

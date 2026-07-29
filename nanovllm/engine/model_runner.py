@@ -1,6 +1,7 @@
 import pickle
 import torch
 import torch.distributed as dist
+import numpy as np
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
@@ -9,6 +10,8 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model, load_model_arch_from_config
+from nanovllm.v1.sample.rejection_sampler import RejectionSampler
+from nanovllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 
 class ModelRunner:
@@ -31,6 +34,16 @@ class ModelRunner:
         self.model = model_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.speculative_config = config.speculative_config
+        if self.speculative_config is not None:
+            self.drafter = NgramProposer(
+                prompt_lookup_min=self.speculative_config.prompt_lookup_min,
+                prompt_lookup_max=self.speculative_config.prompt_lookup_max,
+                num_speculative_tokens=self.speculative_config.num_speculative_tokens,
+                max_model_len=config.max_model_len,
+                max_num_seqs=config.max_num_seqs,
+            )
+            self.rejection_sampler = RejectionSampler(self.sampler)
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -192,10 +205,148 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    def propose_draft_token_ids(self, seqs: list[Sequence]) -> list[list[int]]:
+        if self.speculative_config is None:
+            raise RuntimeError("Speculative decoding is not configured")
+        max_model_len = self.config.max_model_len
+        num_tokens_no_spec = np.empty(len(seqs), dtype=np.int32)
+        token_ids_cpu = np.zeros((len(seqs), max_model_len), dtype=np.int32)
+        for index, seq in enumerate(seqs):
+            seq_len = min(len(seq), max_model_len)
+            num_tokens_no_spec[index] = seq_len
+            token_ids_cpu[index, :seq_len] = np.asarray(
+                seq.token_ids[:seq_len], dtype=np.int32
+            )
+        return self.drafter.propose(num_tokens_no_spec, token_ids_cpu)
+
+    def prepare_spec_decode(
+        self,
+        seqs: list[Sequence],
+        draft_token_ids: list[list[int]],
+        reservations: list[dict[str, list[int] | int]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        input_ids: list[int] = []
+        positions: list[int] = []
+        draft_row_indices: list[int] = []
+        bonus_row_indices: list[int] = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        slot_mapping: list[int] = []
+        block_tables_list: list[list[int]] = []
+        offset = 0
+        for seq, seq_draft_token_ids, reservation in zip(
+            seqs, draft_token_ids, reservations
+        ):
+            seq_start_pos = seq.num_computed_tokens
+            seq_total_len = len(seq) + len(seq_draft_token_ids)
+            seq_input_ids = seq.token_ids[seq_start_pos:] + seq_draft_token_ids
+            q_len = len(seq_input_ids)
+            if q_len == 0:
+                raise RuntimeError("Speculative decode requires an uncomputed token")
+            block_table = seq.block_table + reservation["new_block_ids"]
+            input_ids.extend(seq_input_ids)
+            positions.extend(range(seq_start_pos, seq_total_len))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + q_len)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seq_total_len)
+            max_seqlen_q = max(max_seqlen_q, q_len)
+            max_seqlen_k = max(max_seqlen_k, seq_total_len)
+            block_tables_list.append(block_table)
+            for position in range(seq_start_pos, seq_total_len):
+                block_id = block_table[position // self.block_size]
+                slot_mapping.append(block_id * self.block_size + position % self.block_size)
+
+            num_drafts = len(seq_draft_token_ids)
+            draft_start = q_len - num_drafts - 1
+            if num_drafts:
+                draft_row_indices.extend(
+                    range(offset + draft_start, offset + draft_start + num_drafts)
+                )
+            bonus_row_indices.append(offset + q_len - 1)
+            offset += q_len
+
+        input_ids_tensor = torch.tensor(
+            input_ids, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        positions_tensor = torch.tensor(
+            positions, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        verify_row_indices = torch.tensor(
+            draft_row_indices + bonus_row_indices,
+            dtype=torch.int64,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+        cu_seqlens_q_tensor = torch.tensor(
+            cu_seqlens_q, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        cu_seqlens_k_tensor = torch.tensor(
+            cu_seqlens_k, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        slot_mapping_tensor = torch.tensor(
+            slot_mapping, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        set_context(
+            True,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping_tensor,
+            None,
+            self.prepare_block_tables_from_lists(block_tables_list),
+        )
+        return input_ids_tensor, positions_tensor, verify_row_indices
+
+    def prepare_block_tables_from_lists(self, block_tables_list: list[list[int]]):
+        max_len = max(len(block_table) for block_table in block_tables_list)
+        block_tables = [
+            block_table + [-1] * (max_len - len(block_table))
+            for block_table in block_tables_list
+        ]
+        return torch.tensor(
+            block_tables, dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+
+    def run_spec_decode(
+        self,
+        seqs: list[Sequence],
+        draft_token_ids: list[list[int]],
+        reservations: list[dict[str, list[int] | int]],
+    ) -> list[list[int]] | None:
+        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        input_ids, positions, verify_row_indices = self.prepare_spec_decode(
+            seqs, draft_token_ids, reservations
+        )
+        verify_logits = self.run_model(
+            input_ids,
+            positions,
+            is_prefill=True,
+            spec_row_indices=verify_row_indices,
+        )
+        token_ids = (
+            self.rejection_sampler(draft_token_ids, verify_logits, temperatures)
+            if self.rank == 0
+            else None
+        )
+        reset_context()
+        return token_ids
+
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        is_prefill: bool,
+        spec_row_indices: torch.Tensor | None = None,
+    ):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            hidden_states = self.model(input_ids, positions)
+            if spec_row_indices is not None:
+                return self.model.compute_logits(
+                    hidden_states, return_all_logits=True
+                )[spec_row_indices]
+            return self.model.compute_logits(hidden_states)
         else:
             bs = input_ids.size(0)
             context = get_context()

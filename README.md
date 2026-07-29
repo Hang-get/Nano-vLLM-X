@@ -18,6 +18,9 @@ A lightweight vLLM implementation built from scratch.
 
 ## Installation
 
+N-gram speculative decoding is available through `speculative_config`. It uses
+Numba for prompt lookup and Triton for GPU rejection sampling.
+
 ```bash
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
 ```
@@ -33,10 +36,19 @@ huggingface-cli download --resume-download Qwen/Qwen3-0.6B \
 
 ## Quick Start
 
-See `example.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
+See `example.py` or `example_sd.py` for usage. The API mirrors vLLM's interface with minor differences in the `LLM.generate` method:
 ```python
 from nanovllm import LLM, SamplingParams
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
+llm = LLM(
+    "/YOUR/MODEL/PATH",
+    enforce_eager=True,
+    tensor_parallel_size=1,
+    speculative_config={
+        "method": "ngram",
+        "num_speculative_tokens": 3,
+        "prompt_lookup_max": 2,
+    },
+)
 sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
@@ -46,6 +58,9 @@ outputs[0]["text"]
 ## Benchmark
 
 See `bench.py` for benchmark.
+
+The benchmark enables N-gram speculative decoding and reports the draft-token
+acceptance rate. Omit `speculative_config` to use standard decoding.
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)

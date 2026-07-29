@@ -23,8 +23,10 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        self.num_computed_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
+        self.keep_token_ids = False
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -69,12 +71,40 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def append_tokens(self, token_ids: list[int] | int):
+        if isinstance(token_ids, int):
+            token_ids = [token_ids]
+        for token_id in token_ids:
+            self.append_token(token_id)
+
     def __getstate__(self):
-        last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        last_state = (
+            self.token_ids
+            if self.is_prefill or self.keep_token_ids
+            else self.last_token
+        )
+        return (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_computed_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            self.keep_token_ids,
+            last_state,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        (
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_computed_tokens,
+            self.num_scheduled_tokens,
+            self.block_table,
+            self.keep_token_ids,
+            last_state,
+        ) = state
         if isinstance(last_state, list):
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
