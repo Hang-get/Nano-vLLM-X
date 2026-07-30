@@ -1,6 +1,6 @@
 TARGET_ARCH = "Qwen3ForCausalLM"
 DRAFT_ARCH = "LlamaForCausalLMEagle3"
-AUXILIARY_LAYER_IDS = (2, 18, 33)
+AUXILIARY_LAYER_IDS = (2, 20, 37)
 
 
 def _architecture(config, role: str, path: str) -> str:
@@ -56,21 +56,21 @@ def validate_eagle3_checkpoint_pair(
     }
     target_expected = {
         "architecture": TARGET_ARCH,
-        "hidden_size": 2560,
-        "intermediate_size": 9728,
-        "num_hidden_layers": 36,
-        "num_attention_heads": 32,
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 40,
         "num_key_value_heads": 8,
         "head_dim": 128,
         "vocab_size": 151936,
-        "max_position_embeddings": 262144,
+        "max_position_embeddings": 40960,
         "bos_token_id": 151643,
         "eos_token_id": 151645,
         "attention_bias": False,
         "hidden_act": "silu",
         "rms_norm_eps": 1e-6,
-        "rope_theta": 5000000,
-        "tie_word_embeddings": True,
+        "rope_theta": None,  # validated from config at runtime
+        "tie_word_embeddings": False,
         "dtype": "bfloat16",
     }
     draft_values = {
@@ -95,21 +95,21 @@ def validate_eagle3_checkpoint_pair(
     }
     draft_expected = {
         "architecture": DRAFT_ARCH,
-        "hidden_size": 2560,
-        "intermediate_size": 12288,
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
         "num_hidden_layers": 1,
-        "num_attention_heads": 32,
+        "num_attention_heads": 40,
         "num_key_value_heads": 8,
         "head_dim": 128,
         "vocab_size": 151936,
         "draft_vocab_size": 32000,
-        "max_position_embeddings": 2048,
+        "max_position_embeddings": 65536,
         "bos_token_id": 151643,
         "eos_token_id": 151645,
         "attention_bias": False,
         "hidden_act": "silu",
         "rms_norm_eps": 1e-6,
-        "rope_theta": 1000000,
+        "rope_theta": None,
         "tie_word_embeddings": False,
         "dtype": "bfloat16",
     }
