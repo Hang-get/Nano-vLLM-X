@@ -50,7 +50,7 @@ def validate_eagle3_checkpoint_pair(
         "attention_bias": target_config.attention_bias,
         "hidden_act": target_config.hidden_act,
         "rms_norm_eps": target_config.rms_norm_eps,
-        "rope_theta": target_config.rope_theta,
+        "rope_theta": getattr(target_config, "rope_theta", None) or target_config.rope_parameters.get("rope_theta"),
         "tie_word_embeddings": target_config.tie_word_embeddings,
         "dtype": _dtype_name(target_config),
     }
@@ -89,7 +89,7 @@ def validate_eagle3_checkpoint_pair(
         "attention_bias": draft_config.attention_bias,
         "hidden_act": draft_config.hidden_act,
         "rms_norm_eps": draft_config.rms_norm_eps,
-        "rope_theta": draft_config.rope_theta,
+        "rope_theta": getattr(draft_config, "rope_theta", None) or draft_config.rope_parameters.get("rope_theta"),
         "tie_word_embeddings": draft_config.tie_word_embeddings,
         "dtype": _dtype_name(draft_config),
     }
@@ -114,7 +114,9 @@ def validate_eagle3_checkpoint_pair(
         "dtype": "bfloat16",
     }
     for name, expected in target_expected.items():
-        _require("target", target_path, name, target_values[name], expected)
+        if expected is not None:
+            _require("target", target_path, name, target_values[name], expected)
     for name, expected in draft_expected.items():
-        _require("draft", draft_path, name, draft_values[name], expected)
+        if expected is not None:
+            _require("draft", draft_path, name, draft_values[name], expected)
     return AUXILIARY_LAYER_IDS

@@ -10,11 +10,6 @@ def main():
         path,
         enforce_eager=True,
         tensor_parallel_size=1,
-        speculative_config={
-            "method": "ngram",
-            "num_speculative_tokens": 3,
-            "prompt_lookup_max": 2,
-        },
     )
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)

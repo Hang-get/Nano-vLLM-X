@@ -33,11 +33,12 @@ def main():
         args.model,
         enforce_eager=True,
         tensor_parallel_size=1,
-        max_model_len=2048 if args.method == "eagle3" else 4096,
+        max_model_len=1024 if args.method == "eagle3" else 4096,
+        max_num_batched_tokens=1024 if args.method == "eagle3" else 16384,
         gpu_memory_utilization=0.8,
         speculative_config=speculative_config,
     )
-    sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
+    sampling_params = SamplingParams(temperature=0.6, max_tokens=64)
     prompts = [
         "Introduce yourself.",
         "List all prime numbers below 100.",

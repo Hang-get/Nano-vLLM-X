@@ -317,7 +317,7 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
+            for i in range(seq.num_cached_tokens // self.block_size, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
                     end = start + self.block_size

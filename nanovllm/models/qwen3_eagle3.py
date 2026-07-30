@@ -10,6 +10,8 @@ from nanovllm.models.qwen3 import Qwen3DecoderLayer
 class Qwen3Eagle3DecoderLayer(Qwen3DecoderLayer):
     def __init__(self, config, layer_idx: int):
         super().__init__(config)
+        del self.self_attn.q_norm
+        del self.self_attn.k_norm
         qkv_input_size = 2 * config.hidden_size if layer_idx == 0 else config.hidden_size
         self.self_attn.qkv_proj = QKVParallelLinear(
             qkv_input_size,
