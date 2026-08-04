@@ -25,19 +25,22 @@
 `SpeculativeConfig` 新增字段：
 
 ```python
-tree_top_k: int = 1       # 每个节点的分支数。1 = 线性模式（回退）
-tree_max_depth: int = 0   # 树深度。0 = 使用 num_speculative_tokens 作为线性深度
+tree_top_k: int = 1         # 每个节点的最大分支数。1 = 线性模式（回退）
+tree_max_depth: int = 0     # 最大树深度。0 = 使用 num_speculative_tokens 作为线性深度
+tree_prune_ratio: float = 0.0  # 动态修剪阈值。0 = 不修剪；>0 = 只保留 prob >= ratio*max_prob 的子节点
 ```
 
-| tree_top_k | tree_max_depth | 行为 |
-|------------|----------------|------|
-| 1 | 任意 | 线性模式，等价于当前行为 |
-| >=2 | >=1 | 树形模式，节点数 = sum_{d=0}^{max_depth-1} top_k^d |
+| tree_top_k | tree_max_depth | tree_prune_ratio | 行为 |
+|------------|----------------|-------------------|------|
+| 1 | 任意 | 任意 | 线性模式，等价于当前行为 |
+| >=2 | >=1 | 0 | 固定 k-ary 树，节点数 = sum(top_k^d) |
+| >=2 | >=1 | >0 | 动态修剪，每节点保留 prob 高于阈值的子节点 |
 
 验证约束：
 - `tree_top_k >= 1`
 - 树形模式下 `tree_max_depth >= 1`
-- 树节点总数不超过 `max_model_len - seq_len`
+- `tree_prune_ratio` in `[0, 1]`
+- 实际树节点总数不超过 `max_model_len - seq_len`
 
 ## 4. 树形拓扑数据结构
 
@@ -46,7 +49,7 @@ tree_max_depth: int = 0   # 树深度。0 = 使用 num_speculative_tokens 作为
 ```python
 @dataclass
 class TreeTopology:
-    total_nodes: int              # 逻辑节点总数（含 root: 1 + sum(top_k^d) for d=1..max_depth-1）
+    total_nodes: int              # 逻辑节点总数（含 root，实际值由动态修剪决定）
     draft_nodes: int              # 实际 draft 节点数（不含 root）
     parent: list[int]             # parent[i] = 父节点索引，root 为 -1
     children: list[list[int]]     # children[i] = [子节点索引列表]
@@ -100,29 +103,42 @@ mask[i][j] = True iff j is ancestor of i (including i itself)
 
 ### 5.1 算法
 
-BFS 层级生成，每层节点统一 batch forward：
+BFS 层级生成，每层节点统一 batch forward，每节点动态修剪低概率分支：
 
 ```
 current_nodes = [root]  # root = pending_root，已在 cache
 for depth in range(1, max_depth):  # depth 1..max_depth-1
+    if not current_nodes:
+        break  # 所有分支被修剪，提前终止
     收集当前层所有活跃节点的 (input_ids, fused_hidden, positions)
     一次 batch forward → logits, next_hidden
-    每个节点采样 top_k candidates → 创建子节点
-    子节点入队列（下一层）
+    next_nodes = []  # 下一层节点
+    for each node in current_nodes:
+        probs = softmax(logits[node])  # 该节点的概率分布
+        topk_values, topk_indices = topk(probs, tree_top_k)  # 取 top-k
+        # 动态修剪: 只保留概率高于阈值的子节点
+        threshold = tree_prune_ratio * topk_values[0]  # ratio * max_prob
+        keep = topk_values >= threshold
+        for i in where(keep):
+            create child_node(token=topk_indices[i], prob=topk_values[i])
+            next_nodes.append(child_node)
     更新 TreeTopology
+    current_nodes = next_nodes
 ```
 
 ### 5.2 Batch 策略
 
-同深度节点批量处理：
+同深度节点批量处理，由于动态修剪，batch size 可能小于理论最大值：
 
-| Depth | Batch size |
+| Depth | Batch size (最大) |
 |-------|-----------|
-| 1 | top_k |
-| 2 | top_k^2 |
-| 3 | top_k^3 |
+| 1 | ≤ top_k |
+| 2 | ≤ top_k^2 |
+| 3 | ≤ top_k^3 |
 
 > 注意：root (depth=0) 是 pending_root，已在 target KV cache 中，draft 不需要重新 forward。
+
+> 动态修剪的效果：每个节点的子节点数在 [1, top_k] 之间动态变化。当概率分布高度集中时（大多数情况），修剪使树偏向链状，节省计算；当分布更平坦时，保留更多分支以提升命中率。
 
 ### 5.3 Eagle3Proposer.propose() 签名变更
 
@@ -182,13 +198,15 @@ class TreeDraftKVManager:
 
 ### 6.3 Block 预留
 
-`SpecReservation.new_block_ids` 预留量从 `K`（线性）变为 `num_tree_nodes`：
+`SpecReservation.new_block_ids` 预留量从 `K`（线性）变为 `实际树节点数`（动态修剪后的真实节点数）：
 
 ```
-树节点总数 = sum_{d=0}^{max_depth-1} top_k^d
+实际树节点数 ≤ 最大树节点数 = sum_{d=0}^{max_depth-1} top_k^d
 ```
 
-例：`top_k=2, max_depth=4` → 15 节点 → 预留 15 token 位置（约 1 block）。
+例：`top_k=2, max_depth=4, prune_ratio=0.05` → 最大 15 节点，实际通常远少于 15（概率分布通常集中在少数分支）。
+
+预留时使用实际生成的树节点数确定 block 需求。
 
 ## 7. Target 验证：Tree Attention Mask
 
@@ -460,7 +478,7 @@ def run_eagle3_spec_decode(seqs, reservations):
 
 | 文件 | 改动 | 复杂度 |
 |------|------|--------|
-| `config.py` | 新增 `tree_top_k`, `tree_max_depth` | 低 |
+| `config.py` | 新增 `tree_top_k`, `tree_max_depth`, `tree_prune_ratio` | 低 |
 | `layers/attention.py` | 新增 `_tree_attention()` 分支 | 中 |
 | `utils/context.py` | 新增 tree_verify 相关字段 | 低 |
 | `v1/spec_decode/types.py` | 新增 `TreeTopology`，扩展 `DraftProposal` | 低 |
@@ -502,3 +520,5 @@ def run_eagle3_spec_decode(seqs, reservations):
 | 树节点数 > 预留 block 容量 | scheduler 预留阶段检查，不足时 fallback 到线性模式 |
 | 树的 leaf 节点在非最大深度被截断 | 正常流程：leaf 的 `children=[]`，排名验证在此处自然终止 |
 | Draft KV cache 全满 | 与当前线性版行为一致：拒绝生成更多 draft，`max_depth` 截断 |
+| 动态修剪导致某层无子节点 | 树在该深度提前终止（正常行为），排名验证在终止处取 bonus token |
+| `tree_prune_ratio=1`（修剪所有子节点） | 实际效果：每个节点仅保留 top-1（退化接近线性，但 root 仍可取 top-1 作为唯一子节点） |
