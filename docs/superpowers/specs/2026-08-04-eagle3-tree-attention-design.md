@@ -198,15 +198,27 @@ class TreeDraftKVManager:
 
 ### 6.3 Block 预留
 
-`SpecReservation.new_block_ids` 预留量从 `K`（线性）变为 `实际树节点数`（动态修剪后的真实节点数）：
+`SpecReservation.new_block_ids` 预留量从 `K`（线性）变为树节点数。由于动态修剪，**实际节点数在生成完成后才知道**，但 scheduler 必须在生成前分配 blocks。
+
+**策略：按最大节点数预留，生成后释放未使用的 blocks**
 
 ```
-实际树节点数 ≤ 最大树节点数 = sum_{d=0}^{max_depth-1} top_k^d
+最大节点数 = sum_{d=0}^{max_depth-1} top_k^d
 ```
 
-例：`top_k=2, max_depth=4, prune_ratio=0.05` → 最大 15 节点，实际通常远少于 15（概率分布通常集中在少数分支）。
+例：`top_k=2, max_depth=4, prune_ratio=0.05` → 预留 max 15 节点（约 1 block）。动态修剪后实际树可能只有 5-10 节点，多余 block 在验证后释放。
 
-预留时使用实际生成的树节点数确定 block 需求。
+**为什么按最大预留是合理的**：
+- 树节点数有限（top_k=3, depth=4 → 40 节点 ≈ 1 block），预留开销极小
+- 如果预留阶段 block 不足以满足最大节点数 → fallback 到 `max_depth-1` 或线性模式
+- 生成完成后，实际使用的 block 保留，未使用的归还给 block manager
+
+```python
+def reserve_spec_budget(seq, tree_config):
+    max_nodes = sum(tree_config.top_k ** d for d in range(tree_config.max_depth))
+    # allocate max_nodes worth of blocks
+    # after generation: release (max_nodes - actual_nodes) worth of blocks
+```
 
 ## 7. Target 验证：Tree Attention Mask
 
@@ -407,6 +419,40 @@ while True:
 - **对概率值不敏感**：草稿模型只需要输出正确的**相对排名**（top-L 集合），不需要精确概率。训练和使用更加友好。
 - **线性回退**：`top_k=1` → 每个节点只有 1 个子节点 → 退化为"大模型每步采样是否恰好等于草稿模型预测"的单链验证。
 
+### 8.4 Root Logits 获取
+
+排名验证的第一步需要大模型在 **root 节点**（pending_root）处的 target 分布来进行采样。
+
+**终极解法：利用验证 logits 的 bonus row**
+
+当前线性验证流程中，`verify_row_indices` 包含 draft row + bonus row。bonus row 对应的正是：大模型在最后一个 draft token 位置产生的 logits（预测 bonus token）。这些 logits **同时也是**下一步的"root logits"：
+
+```
+Step N 的验证:
+  输入:  [pending_root, draft_0, ..., draft_{K-1}]
+  logits: [验证 draft_0 的 logits, ..., 验证 draft_{K-1} 的 logits, bonus logits]
+                                                                  ^
+                                                    这些 logits = Step N+1 的 root logits
+```
+
+只需将验证结束后的 **bonus/recovery row 的 logits** 保存到 `Eagle3RequestState`，下一步排名验证时直接取用。
+
+**数据结构扩展**：
+```python
+@dataclass
+class Eagle3RequestState:
+    anchor_hidden_states: torch.Tensor   # 不变
+    draft_num_computed_tokens: int       # 不变
+    saved_logits: torch.Tensor | None    # 新增: 上一步的 bonus row logits (= 当前步的 root logits)
+    valid: bool = True
+```
+
+**验收流程调整**：
+1. 第一步（prefill 后）：root logits 来自 prefill 阶段大模型的样本后 logits
+2. 后续步骤：`saved_logits` 就是当前步的 root logits，排名验证从这开始采样
+
+**优点**：无需将 pending_root 纳入 tree 输入，避免 root 重复出现在 prompt cache 和 tree KV 中。
+
 ## 9. Model Runner 集成
 
 ### 9.1 prepare_spec_decode 变更
@@ -517,7 +563,7 @@ def run_eagle3_spec_decode(seqs, reservations):
 | `max_depth` 截断（seq 剩余长度不足） | 动态减小 `max_depth`，树在允许的深度提前终止 |
 | batch 内混合树形/线性 | 通过 `tree_topologies` 的 per-sequence None/非None 区分。线性序列走原代码路径，树形序列走新路径 |
 | 相同 position 不同分支的 RoPE | 已验证可行：tree mask 隔离互不可见，RoPE 的同 position 编码不影响注意力计算结果 |
-| 树节点数 > 预留 block 容量 | scheduler 预留阶段检查，不足时 fallback 到线性模式 |
+| 树节点数 > 预留 block 容量 | scheduler 按最大节点数预留，不足时减小 `max_depth` 或 fallback 到线性模式 |
 | 树的 leaf 节点在非最大深度被截断 | 正常流程：leaf 的 `children=[]`，排名验证在此处自然终止 |
 | Draft KV cache 全满 | 与当前线性版行为一致：拒绝生成更多 draft，`max_depth` 截断 |
 | 动态修剪导致某层无子节点 | 树在该深度提前终止（正常行为），排名验证在终止处取 bonus token |
