@@ -46,12 +46,17 @@ tree_max_depth: int = 0   # 树深度。0 = 使用 num_speculative_tokens 作为
 ```python
 @dataclass
 class TreeTopology:
-    nodes: int                    # 总节点数（含 pending_root）
+    total_nodes: int              # 逻辑节点总数（含 root: 1 + sum(top_k^d) for d=1..max_depth-1）
+    draft_nodes: int              # 实际 draft 节点数（不含 root）
     parent: list[int]             # parent[i] = 父节点索引，root 为 -1
     children: list[list[int]]     # children[i] = [子节点索引列表]
     depth: list[int]              # depth[i]，root=0
-    position_ids: list[int]       # 在原始序列中的 position (prompt_len + depth)
-    bfs_indices: list[int]        # BFS 顺序 → 树节点 ID 的映射
+    rope_positions: list[int]     # RoPE 位置: [prompt_len + depth[i]] (draft节点only)
+    bfs_to_node: list[int]        # BFS 顺序 → 树节点 ID (draft 节点 only)
+
+    def build_tree_internal_mask(self) -> torch.Tensor:
+        """构建 draft 节点间的 N×N boolean mask，True=ancestor"""
+        ...
 ```
 
 ### 4.2 线性化策略
@@ -73,6 +78,8 @@ BFS（广度优先）平整化。示例 `top_k=2, depth=3`（7 个节点）：
 
 ### 4.3 Attention Mask 构建
 
+Tree-internal mask（仅 tree 节点之间）：
+
 ```
 mask[i][j] = True iff j is ancestor of i (including i itself)
 
@@ -87,6 +94,8 @@ mask[i][j] = True iff j is ancestor of i (including i itself)
         6    1  0  1  0  0  0  1
 ```
 
+完整 mask（tree → prompt + tree）见 Section 7.3。Tree 节点可以 attend 到所有 prompt token（包括 root）和所有 tree ancestor，但不能 attend 到兄弟节点。
+
 ## 5. Draft 生成：Top-k 树形 Proposal
 
 ### 5.1 算法
@@ -94,7 +103,8 @@ mask[i][j] = True iff j is ancestor of i (including i itself)
 BFS 层级生成，每层节点统一 batch forward：
 
 ```
-for depth in range(max_depth):
+current_nodes = [root]  # root = pending_root，已在 cache
+for depth in range(1, max_depth):  # depth 1..max_depth-1
     收集当前层所有活跃节点的 (input_ids, fused_hidden, positions)
     一次 batch forward → logits, next_hidden
     每个节点采样 top_k candidates → 创建子节点
@@ -104,14 +114,15 @@ for depth in range(max_depth):
 
 ### 5.2 Batch 策略
 
-同深度节点批量处理，减少 CUDA kernel launch：
+同深度节点批量处理：
 
 | Depth | Batch size |
 |-------|-----------|
-| 0 | 1 (root only) |
 | 1 | top_k |
 | 2 | top_k^2 |
 | 3 | top_k^3 |
+
+> 注意：root (depth=0) 是 pending_root，已在 target KV cache 中，draft 不需要重新 forward。
 
 ### 5.3 Eagle3Proposer.propose() 签名变更
 
@@ -125,10 +136,16 @@ def propose(seqs, reservations, temperatures) -> DraftProposal:
 ```python
 @dataclass
 class DraftProposal:
-    token_ids: list[list[int]]          # 不变：平整化的 draft tokens
-    probabilities: torch.Tensor         # 不变
-    lengths: list[int]                  # 不变
-    tree_topologies: list[TreeTopology | None]  # 新增：None = 线性模式
+    token_ids: list[list[int]]          # 树形: BFS 平整化的 draft tokens
+    probabilities: torch.Tensor         # 所有 draft token 的 prob (BFS 顺序)
+    lengths: list[int]                  # draft token 总数
+    tree_topologies: list[TreeTopology | None]  # None = 线性模式
+
+@dataclass  
+class SpecDecodeResult:
+    output_token_ids: list[list[int]]
+    accepted_draft_counts: list[int]
+    accepted_paths: list[list[int] | None]  # 新增: 树上接受路径的节点索引, None=线性模式
 ```
 
 ## 6. Draft KV Cache：Copy-on-Write
@@ -141,18 +158,21 @@ class DraftProposal:
 
 ### 6.2 实现范围
 
-由 `Eagle3Proposer` 内部管理，不耦合外层 `BlockManager`。
+由 `Eagle3Proposer` 内部管理，不耦合外层 `BlockManager`。KV slot 分配（每个 tree node 写入 `draft_kv_cache` 的哪个位置）由 `TreeDraftKVManager` 内部决定，不在 `TreeTopology` 中暴露。
 
 ```python
 class TreeDraftKVManager:
     def fork(self, parent_node: int, child_node: int) -> None:
-        """子节点继承父节点的 block 引用，ref_count+=1"""
+        """子节点继承父节点的 draft KV block 引用，ref_count+=1"""
     
-    def write(self, node: int, position: int, slot_mapping: int) -> None:
-        """若 block 被共享，则 copy-on-write 分配新 block"""
+    def allocate_slot(self, node: int) -> int:
+        """为树节点分配新的 draft KV slot，若 block 被共享则 copy-on-write"""
+    
+    def write(self, node: int, position: int, k: Tensor, v: Tensor) -> None:
+        """将 KV 写入 slot，trigger copy-on-write if needed"""
     
     def commit(self, accepted_leaf: int) -> list[int]:
-        """返回 root→leaf 路径上所有独占的 block IDs"""
+        """返回 root→accepted_leaf 路径上所有独占的 block IDs"""
     
     def release_node(self, node: int) -> None:
         """释放节点及其独占 blocks，ref_count-=1"""
@@ -172,63 +192,80 @@ class TreeDraftKVManager:
 
 ### 7.1 关键问题
 
-`flash_attn_varlen_func` 不支持自定义 attention mask，只有 `flash_attn_func` 支持。
+`flash_attn_varlen_func` 不支持自定义 attention mask。`flash_attn_func` 支持 mask 但有 block-alignment 限制（通常要求 seqlen 是 128 的倍数）。
 
-**解法**：验证时使用 `flash_attn_func`，手动拼接 prompt KV cache + tree token KV，传入自定义 mask。
+**解法**：Tree attention 部分使用 `torch.nn.functional.scaled_dot_product_attention`（PyTorch 原生 SDPA），它对小尺寸（N≤40）足够高效，会自动 dispatch 到最优后端并支持任意形状的 boolean mask。Prompt KV 部分仍使用 FlashAttention 的 paged attention。
+
+或者简化为：整个 tree verification 的 attention 计算统一使用 `F.scaled_dot_product_attention(Q, K, V, attn_mask=mask)`，对 N≤40 的场景性能完全足够。
 
 ### 7.2 每层 Attention 计算流程
 
 ```
-输入: x_tree = [N, dim]  (tree tokens 的 hidden states)
+输入: x_tree = [N, dim]  (tree draft tokens 的 hidden states, 不含 root)
 
 1. Gather prompt KV from paged cache:
-   K_prompt = gather(k_cache, block_table)  # [P, heads, dim]
-   V_prompt = gather(v_cache, block_table)
+   K_prompt = gather(k_cache[layer], block_table)  # [P, kv_heads, dim]
+   V_prompt = gather(v_cache[layer], block_table)
 
-2. Compute tree KV:
-   K_tree = W_K @ x_tree  # [N, heads, dim]
-   V_tree = W_V @ x_tree
+2. Compute tree KV from current input (不写入 cache):
+   K_tree = W_K @ x_tree  # [N, kv_heads, dim]
+   V_tree = W_V @ x_tree  # [N, kv_heads, dim]
+   # 注意: 此处 store_kvcache 被跳过，tree tokens 的 KV 不持久化
 
 3. Concat + build mask:
-   K_full = [K_prompt; K_tree]  # [P+N, heads, dim]
-   V_full = [V_prompt; V_tree]
+   K_full = cat[K_prompt, K_tree]  # [P+N, kv_heads, dim]
+   V_full = cat[V_prompt, V_tree]
    
-   full_mask[0:P, 0:P] = causal (lower triangular)
-   full_mask[P:P+N, 0:P] = True (tree can attend to all prompt)
-   full_mask[P:P+N, P:P+N] = tree_mask (ancestor-only)
+   full_mask[0:P, 0:P] = causal (lower triangular)    # prompt 内部
+   full_mask[P:P+N, 0:P] = True (tree→prompt: all)    # tree 可以看到所有 prompt
+   full_mask[P:P+N, P:P+N] = tree_mask (ancestor-only) # tree 内部只有祖先行
 
-4. FlashAttention:
-   # Note: flash_attn_func attn_mask: True = attend, False = mask
-   # full_mask is already True=attend, pass directly
-   o = flash_attn_func(
-       Q_tree,           # [N, heads, dim] — only tree tokens query
-       K_full,           # [P+N, heads, dim]
-       V_full,           # [P+N, heads, dim]
-       causal=False,
-       attn_mask=full_mask[P:P+N, :]  # boolean mask, True=allow
+4. PyTorch SDPA (自动 dispatch 到最优后端):
+   o = F.scaled_dot_product_attention(
+       Q_tree,           # [N, q_heads, dim]
+       K_full,           # [P+N, kv_heads, dim]
+       V_full,           # [P+N, kv_heads, dim]
+       attn_mask=full_mask[P:P+N, :],  # boolean mask
+       scale=self.scale,
    )
 ```
+
+> **为什么用 `F.scaled_dot_product_attention` 而不是 `flash_attn_func`**：SDPA 对小尺寸（N≤40）无 block-alignment 限制，自动 dispatch 到最优 kernel（可能是 FlashAttention、Memory-efficient attention 或 math fallback），同时支持任意 boolean mask。
+
+> **关键设计点**: Tree tokens 的 KV 仅在 `K_full`/`V_full` 中存在，不调用 `store_kvcache` 写入主 cache。Commit 后接受路径上的 token 通过正常 decode 流程进入 cache。
 
 ### 7.3 Mask 示意
 
 ```
-prompt tokens (P=5):   [t0, t1, t2, t3, t4]     (cached)
-tree tokens (N=7):     [r0, c1, c2, g1, g2, g3, g4]  (new)
+prompt tokens (P=5):    [t0, t1, t2, t3, t4]      (cached, 含 pending_root)
+tree draft tokens (N=6): [c1, c2, g1, g2, g3, g4]  (新建，pending_root不在这)
+                          ^   ^   ^   ^   ^   ^
+                         depth=1  depth=2
 
-Tree → full context mask (7 rows × 12 cols):
-              t0 t1 t2 t3 t4 | r0 c1 c2 g1 g2 g3 g4
-         r0    1  1  1  1  1 |  1  0  0  0  0  0  0
-         c1    1  1  1  1  1 |  1  1  0  0  0  0  0
-         c2    1  1  1  1  1 |  1  0  1  0  0  0  0
-         g1    1  1  1  1  1 |  1  1  0  1  0  0  0
-         g2    1  1  1  1  1 |  1  1  0  0  1  0  0
-         g3    1  1  1  1  1 |  1  0  1  0  0  1  0
-         g4    1  1  1  1  1 |  1  0  1  0  0  0  1
+Tree → full context mask (6 rows × 11 cols):
+              t0 t1 t2 t3 t4 | c1 c2 g1 g2 g3 g4
+         c1    1  1  1  1  1 |  1  0  0  0  0  0     c1 → prompt + 自己
+         c2    1  1  1  1  1 |  0  1  0  0  0  0     c2 → prompt + 自己 (兄弟不可见)
+         g1    1  1  1  1  1 |  1  0  1  0  0  0     g1 → prompt + c1 + 自己
+         g2    1  1  1  1  1 |  1  0  0  1  0  0     g2 → prompt + c1 + 自己
+         g3    1  1  1  1  1 |  0  1  0  0  1  0     g3 → prompt + c2 + 自己
+         g4    1  1  1  1  1 |  0  1  0  0  0  1     g4 → prompt + c2 + 自己
 ```
+
+> pending_root (t4) 在 prompt cache 中，tree draft 节点通过 `full_mask[P:, 0:P] = True` 自然可以 attend 到它。
 
 ### 7.4 位置编码
 
-每个树节点使用 `prompt_len + depth` 作为 position。同层但不同分支的节点 share 相同 position，tree mask 已隔离互不可见。
+RoPE 位置使用 `prompt_len + logical_depth`（同层不同分支共享相同 position，tree mask 已隔离互不可见，逻辑正确）。
+
+KV cache slot 分配使用独立的 BFS index（每个树节点唯一 slot），与 RoPE position **解耦**：
+
+| 用途 | 值 | 说明 |
+|------|-----|------|
+| RoPE 位置 | `prompt_len + depth` | 同层分支共享，保证相对位置正确 |
+| KV cache slot | `prompt_len + bfs_index` | 每个节点唯一，避免分支间冲突 |
+
+Tree token KV **不写入主 target KV cache**（因为多数会被拒绝）。验证时 tree token 的 K/V 仅在 `K_full`/`V_full` 拼接张量中存在，不持久化。Commit 时只将接受路径上的 token KV 通过正常 decode 流程写入 cache。
 
 ### 7.5 Attention 模块修改
 
@@ -238,34 +275,55 @@ Tree → full context mask (7 rows × 12 cols):
 def forward(self, q, k, v):
     context = get_context()
     if context.is_tree_verify:
+        # 跳过 store_kvcache (tree tokens 的 KV 不持久化)
         return self._tree_attention(q, k, v)
     elif context.is_prefill:
-        ...  # 不变
+        store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping)
+        # ... 不变
     else:
-        ...  # 不变
+        # decode: store_kvcache 已有，不变
+        ...
 
 def _tree_attention(self, q, k, v):
-    # 1. gather prompt KV from cache
-    # 2. concat with tree KV
-    # 3. flash_attn_func with tree mask
+    # 1. gather prompt KV from cache (每层)
+    # 2. concat [K_prompt, K_tree], [V_prompt, V_tree]
+    # 3. F.scaled_dot_product_attention(Q_tree, K_full, V_full, attn_mask=tree_mask)
+    # 注意: K_tree = k, V_tree = v (来自当前层的投影，不存 cache)
 ```
+
+> 关键区别：`tree_verify` 分支**不调用** `store_kvcache`，tree tokens 的 K/V 仅在 attention 计算中使用。
 
 ### 7.6 Prompt KV Gather 说明
 
-prompt KV 的 gather 操作在**每层 attention 调用时执行**（因为不同层的 KV cache 内容不同）。Gather 本身是 tensor indexing 操作（轻量），不涉及显存拷贝。
+prompt KV 的 gather 操作在**每层 attention 调用时执行**（不同层的 KV cache 内容不同）。Gather 是 tensor indexing 操作，不涉及显存分配和拷贝。对于 36 层 × 2048 prompt × 8 kv_heads × 128 dim × bfloat16 ≈ 150MB 的读取量，在 GPU 带宽下（~1TB/s）耗时 < 0.2ms，可以接受。
 
 伪代码：
 ```python
 def gather_prompt_kv(k_cache_layer, block_table, prompt_len, block_size):
-    # Gather prompt tokens' KV from paged cache to contiguous tensor
-    # Input:  k_cache_layer [num_blocks, block_size, heads, dim]
-    # Output: [prompt_len, heads, dim]
-    blocks = k_cache_layer[block_table]       # [num_blocks, block_size, heads, dim]
-    flat = blocks.reshape(-1, heads, dim)      # [num_blocks*block_size, heads, dim]
+    # k_cache_layer: [num_blocks, block_size, kv_heads, dim]
+    # Output: [prompt_len, kv_heads, dim]
+    blocks = k_cache_layer[block_table]       # gather blocks
+    flat = blocks.reshape(-1, kv_heads, dim)   # flatten
     return flat[:prompt_len]                   # trim padding
 ```
 
-### 7.7 Context 扩展
+### 7.7 多 Sequence 批处理
+
+树形模式不使用 `cu_seqlens`（需要每 sequence 独立 mask），采用 **padding + block-diagonal mask**：
+
+```
+批处理流程:
+1. 找到 batch 内最大的 N_max = max(N_i) 和 K_max = max(P_i + N_i)
+2. 填充短序列到最大长度 (0 填充，mask 中填 False)
+   Q: [B, N_max, q_heads, dim]
+   K_full: [B, K_max, kv_heads, dim]
+3. 构建 block-diagonal 掩码:
+   mask[b, i, j] = 1  iff (i < N_b and j < P_b+N_b and tree_mask_b[i][j])
+   否则 0
+4. F.scaled_dot_product_attention(Q, K_full, V_full, attn_mask=mask)
+```
+
+### 7.8 Context 扩展
 
 ```python
 # context 新增字段（仅 tree_verify 时有效）
@@ -328,18 +386,33 @@ if node.is_leaf and node.was_accepted:
 def prepare_spec_decode(seqs, draft_token_ids, reservations, 
                         tree_topologies=None, include_query_lengths=False):
     if tree_topologies is not None:
-        # 树形路径：
+        # 树形路径: 使用 padding-batched flash_attn_func
         #   1. BFS 平整化 draft tokens
         #   2. 构建每个 request 的 tree attention mask
-        #   3. 计算 verify_row_indices（每个树节点 1 行 logit）
-        #   4. 准备 prompt KV gather 参数
+        #   3. Pad 所有 sequence 到相同长度 (mask 用 False 填充)
+        #   4. Q: [B, N_max, dim], K: [B, P_max+N_max, kv_heads, dim]
+        #   5. 计算 verify_row_indices（每个 tree node 1 行 logit）
         return (input_ids, positions, verify_rows, tree_masks, query_lengths)
     else:
-        # 线性路径：现有行为不变
+        # 线性路径：使用 cu_seqlens + flash_attn_varlen_func (现有行为不变)
+        # 输入: flat [total_tokens] + cu_seqlens
         ...
 ```
 
-### 9.2 run_eagle3_spec_decode 变更
+> 树形和线性模式下 `input_ids` 和 `positions` 的形状不同：
+> - 线性: `[total_tokens]`（所有 sequence 拼接）
+> - 树形: `[B, N_max]`（padding batched）
+
+### 9.3 混合 Batch 处理
+
+如果 batch 内部分 sequence 使用树形、部分使用线性：
+- 线性 sequence 构造**退化的 TreeTopology**（`top_k=1` 的链，causal mask）
+- 统一走树形路径，用 padding-based batching
+- 避免维护两个并行代码路径
+
+但首次实现建议**不分叉**：要么全部线性、要么全部树形（通过 `tree_topologies is not None` 判断）。
+
+### 9.4 run_eagle3_spec_decode 变更
 
 ```python
 def run_eagle3_spec_decode(seqs, reservations):
@@ -348,19 +421,24 @@ def run_eagle3_spec_decode(seqs, reservations):
     
     # 2. Target verification
     if proposal.tree_topologies:
+        # 树形路径: 使用 padding-batched flash_attn_func (不用 cu_seqlens)
         prepared = prepare_spec_decode(seqs, proposal, reservations,
                                        proposal.tree_topologies, include_query_lengths=True)
         input_ids, positions, verify_rows, tree_masks, query_lens = prepared
         set_context(tree_verify=True, tree_attn_masks=tree_masks, ...)
         target_output = model(input_ids, positions, aux_layer_ids)
+        # 注意: tree tokens 的 KV 未写入主 cache
     else:
-        # 线性路径：现有行为不变
+        # 线性路径：现有行为不变（cu_seqlens + flash_attn_varlen_func）
         ...
     
     # 3. Rejection sampling
     result = rejection_sampler(proposal, verify_logits, tree_topologies)
+    # 树形: result 额外包含 accepted_path (树中接受路径的节点索引列表)
     
-    # 4. Commit: 只保留接受路径的 KV blocks
+    # 4. Commit
+    # 树形: 接受路径上的 tokens 通过后续正常 decode 写入 KV cache
+    #       draft KV manager 释放非接受分支的 copy-on-write blocks
     proposer.commit(seqs, verification_aux, result)
 ```
 
