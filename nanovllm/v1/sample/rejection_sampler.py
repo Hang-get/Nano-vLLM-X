@@ -3,7 +3,7 @@ import torch.nn as nn
 import triton
 import triton.language as tl
 from nanovllm.layers.sampler import Sampler
-from nanovllm.v1.spec_decode.types import SpecDecodeResult
+from nanovllm.v1.spec_decode.types import DraftProposal, SpecDecodeResult
 
 PLACEHOLDER_TOKEN_ID = -1
 
@@ -341,6 +341,86 @@ class RejectionSampler(nn.Module):
             output_token_ids=output_rows,
             accepted_draft_counts=accepted_counts.cpu().tolist(),
         )
+
+
+class RankVerifier(nn.Module):
+    """Tree speculative verifier that samples only from target distributions."""
+
+    def __init__(self, sampler: Sampler):
+        super().__init__()
+        self.sampler = sampler
+
+    def forward(
+        self,
+        proposal: DraftProposal,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        verify_row_indices: list[list[int]],
+    ) -> SpecDecodeResult:
+        topologies = proposal.tree_topologies
+        if topologies is None or any(topology is None for topology in topologies):
+            raise ValueError("RankVerifier requires one tree topology per request")
+        if logits.ndim != 2:
+            raise ValueError("tree verification logits must be rank 2")
+        if len(verify_row_indices) != len(topologies):
+            raise ValueError("tree verify-row batch size mismatch")
+        if temperatures.ndim != 1 or temperatures.numel() != len(topologies):
+            raise ValueError("tree temperatures must have shape [batch_size]")
+
+        outputs: list[list[int]] = []
+        accepted_counts: list[int] = []
+        accepted_paths: list[list[int]] = []
+        for request_idx, (topology, row_indices) in enumerate(
+            zip(topologies, verify_row_indices)
+        ):
+            assert topology is not None
+            if len(row_indices) != topology.draft_nodes + 1:
+                raise ValueError("tree verifier needs root plus one row per draft node")
+            node_rows = {0: row_indices[0]}
+            node_rows.update(
+                {
+                    node: row_indices[offset + 1]
+                    for offset, node in enumerate(topology.bfs_to_node)
+                }
+            )
+            if any(row < 0 or row >= logits.size(0) for row in node_rows.values()):
+                raise ValueError("tree verify row is outside logits")
+
+            output: list[int] = []
+            accepted_path: list[int] = []
+            node = 0
+            temperature = temperatures[request_idx : request_idx + 1]
+            while True:
+                sampled = self.sampler(logits[node_rows[node]].unsqueeze(0), temperature)
+                token_id = int(sampled.item())
+                matching_child = next(
+                    (
+                        child
+                        for child in topology.children[node]
+                        if proposal.token_ids[request_idx][
+                            topology.bfs_to_node.index(child)
+                        ]
+                        == token_id
+                    ),
+                    None,
+                )
+                if matching_child is None:
+                    output.append(token_id)
+                    break
+                node = matching_child
+                accepted_path.append(node)
+                output.append(token_id)
+                if not topology.children[node]:
+                    bonus = self.sampler(
+                        logits[node_rows[node]].unsqueeze(0), temperature
+                    )
+                    output.append(int(bonus.item()))
+                    break
+
+            outputs.append(output)
+            accepted_counts.append(len(accepted_path))
+            accepted_paths.append(accepted_path)
+        return SpecDecodeResult(outputs, accepted_counts, accepted_paths)
 
 
 def generate_uniform_probs(

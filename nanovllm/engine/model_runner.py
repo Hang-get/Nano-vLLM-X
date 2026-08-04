@@ -21,8 +21,10 @@ from nanovllm.v1.spec_decode.types import (
     DraftProposal,
     SpecDecodeResult,
     SpecReservation,
+    TreeTopology,
 )
-from nanovllm.v1.sample.rejection_sampler import RejectionSampler
+from nanovllm.v1.sample.rejection_sampler import RankVerifier, RejectionSampler
+from nanovllm.v1.spec_decode.tree_kv import TreeTargetKVStager
 
 
 class ModelRunner:
@@ -78,9 +80,13 @@ class ModelRunner:
                 self.eagle3_proposer = Eagle3Proposer(
                     self.draft_model,
                     self.block_size,
+                    tree_top_k=self.speculative_config.tree_top_k,
+                    tree_max_depth=self.speculative_config.tree_max_depth,
+                    tree_prune_ratio=self.speculative_config.tree_prune_ratio,
                 )
                 self.drafter = self.eagle3_proposer
             self.rejection_sampler = RejectionSampler(self.sampler)
+            self.rank_verifier = RankVerifier(self.sampler)
         self.warmup_model()
         self.allocate_kv_cache()
         if not self.enforce_eager:
@@ -290,6 +296,7 @@ class ModelRunner:
         for layer_id, module in enumerate(attention_modules):
             module.k_cache = kv_cache[0, layer_id]
             module.v_cache = kv_cache[1, layer_id]
+            module.layer_id = layer_id
 
     def prepare_block_tables(self, block_tables_list: list[list[int]]):
         max_len = max(len(block_table) for block_table in block_tables_list)
@@ -473,6 +480,117 @@ class ModelRunner:
             return (*prepared, query_lengths)
         return prepared
 
+    def prepare_tree_spec_decode(
+        self,
+        seqs: list[Sequence],
+        proposal: DraftProposal,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        list[list[int]],
+        list[TreeTopology],
+        TreeTargetKVStager,
+    ]:
+        """Build flattened root/tree queries and the SDPA ancestor mask."""
+        topologies = proposal.tree_topologies
+        if topologies is None or any(topology is None for topology in topologies):
+            raise ValueError("tree verification requires a topology per request")
+        if len(seqs) != len(proposal.token_ids) or len(seqs) != len(topologies):
+            raise ValueError("tree verification batch size mismatch")
+
+        concrete_topologies = [topology for topology in topologies if topology is not None]
+        batch_size = len(seqs)
+        query_width = max((topology.draft_nodes + 1 for topology in concrete_topologies), default=1)
+        prompt_width = max((max(len(seq) - 1, 0) for seq in seqs), default=0)
+        device = torch.device("cuda")
+        input_ids = torch.zeros(
+            (batch_size, query_width), dtype=torch.int64, pin_memory=True
+        )
+        positions = torch.zeros_like(input_ids)
+        slot_mapping = torch.full(
+            (batch_size, query_width), -1, dtype=torch.int32, pin_memory=True
+        )
+        attn_mask = torch.zeros(
+            (batch_size, query_width, prompt_width + query_width),
+            dtype=torch.bool,
+            device=device,
+        )
+        verify_row_indices: list[list[int]] = []
+        root_rows: list[int] = []
+
+        for request_idx, (seq, tokens, topology) in enumerate(
+            zip(seqs, proposal.token_ids, concrete_topologies)
+        ):
+            root_position = len(seq) - 1
+            if root_position < 0:
+                raise ValueError("tree verification requires a non-empty sequence")
+            if root_position // self.block_size >= len(seq.block_table):
+                raise ValueError("tree root position is outside the primary block table")
+            input_ids[request_idx, 0] = seq.last_token
+            positions[request_idx, 0] = root_position
+            root_block = seq.block_table[root_position // self.block_size]
+            slot_mapping[request_idx, 0] = (
+                root_block * self.block_size + root_position % self.block_size
+            )
+            prompt_len = root_position
+            if prompt_len:
+                attn_mask[request_idx, 0, :prompt_len] = True
+            attn_mask[request_idx, 0, prompt_width] = True
+
+            rows = [request_idx * query_width]
+            for bfs_index, (token_id, node_id, rope_position) in enumerate(
+                zip(tokens, topology.bfs_to_node, topology.rope_positions)
+            ):
+                query_row = bfs_index + 1
+                input_ids[request_idx, query_row] = token_id
+                positions[request_idx, query_row] = rope_position
+                rows.append(request_idx * query_width + query_row)
+                if prompt_len:
+                    attn_mask[request_idx, query_row, :prompt_len] = True
+                ancestor = node_id
+                while ancestor != -1:
+                    if ancestor == 0:
+                        attn_mask[request_idx, query_row, prompt_width] = True
+                    else:
+                        ancestor_bfs = topology.bfs_to_node.index(ancestor)
+                        attn_mask[
+                            request_idx, query_row, prompt_width + 1 + ancestor_bfs
+                        ] = True
+                    ancestor = topology.parent[ancestor]
+            verify_row_indices.append(rows)
+            root_rows.append(rows[0])
+
+        input_ids_gpu = input_ids.flatten().cuda(non_blocking=True)
+        positions_gpu = positions.flatten().cuda(non_blocking=True)
+        slot_mapping_gpu = slot_mapping.flatten().cuda(non_blocking=True)
+        block_tables = self.prepare_block_tables([seq.block_table for seq in seqs])
+        cached_prompt_lens = torch.tensor(
+            [len(seq) - 1 for seq in seqs], dtype=torch.int32, pin_memory=True
+        ).cuda(non_blocking=True)
+        root_rows_tensor = torch.tensor(
+            root_rows, dtype=torch.int64, pin_memory=True
+        ).cuda(non_blocking=True)
+        stager = TreeTargetKVStager(batch_size, query_width)
+        set_context(
+            False,
+            slot_mapping=slot_mapping_gpu,
+            block_tables=block_tables,
+            is_tree_verify=True,
+            tree_attn_mask=attn_mask,
+            tree_cached_prompt_lens=cached_prompt_lens,
+            tree_batch_size=batch_size,
+            tree_query_width=query_width,
+            tree_root_row_indices=root_rows_tensor,
+            tree_kv_stager=stager,
+        )
+        return (
+            input_ids_gpu,
+            positions_gpu,
+            verify_row_indices,
+            concrete_topologies,
+            stager,
+        )
+
     def verify_draft_token_ids(
         self,
         draft_token_ids: list[list[int]],
@@ -559,6 +677,114 @@ class ModelRunner:
         return self.sampler(logits, temperatures).tolist()
 
     @torch.inference_mode()
+    def run_eagle3_tree_propose(
+        self,
+        seqs: list[Sequence],
+        reservations: list[SpecReservation],
+    ) -> DraftProposal:
+        if self.eagle3_proposer is None:
+            raise RuntimeError("EAGLE3 proposer is not initialized")
+        if len(reservations) != len(seqs):
+            raise ValueError("EAGLE3 reservation batch size mismatch")
+        if self.speculative_config.tree_top_k <= 1:
+            raise ValueError("tree proposal requires tree_top_k >= 2")
+        temperatures = self.prepare_sample(seqs)
+        draft_started = self._begin_spec_timing()
+        proposal = self.eagle3_proposer.propose(seqs, reservations, temperatures)
+        self._finish_spec_timing("draft", draft_started)
+        if proposal.tree_topologies is None:
+            raise ValueError("tree proposer returned a linear proposal")
+        return proposal
+
+    @torch.inference_mode()
+    def run_eagle3_tree_verify(
+        self,
+        seqs: list[Sequence],
+        reservations: list[SpecReservation],
+        proposal: DraftProposal,
+    ) -> SpecDecodeResult:
+        if self.eagle3_proposer is None:
+            raise RuntimeError("EAGLE3 proposer is not initialized")
+        if proposal.tree_topologies is None:
+            raise ValueError("tree verification requires a tree proposal")
+        temperatures = self.prepare_sample(seqs)
+        return self._run_eagle3_tree_verify(
+            seqs,
+            reservations,
+            proposal,
+            temperatures,
+        )
+
+    def _run_eagle3_tree_verify(
+        self,
+        seqs: list[Sequence],
+        reservations: list[SpecReservation],
+        proposal: DraftProposal,
+        temperatures: torch.Tensor,
+    ) -> SpecDecodeResult:
+        verify_started = self._begin_spec_timing()
+        prepared = self.prepare_tree_spec_decode(seqs, proposal)
+        (
+            input_ids,
+            positions,
+            verify_row_indices,
+            topologies,
+            stager,
+        ) = prepared
+        try:
+            target_output = self.model(
+                input_ids,
+                positions,
+                self.speculative_config.auxiliary_layer_ids,
+            )
+            if not isinstance(target_output, TargetModelOutput):
+                raise TypeError("target model did not return auxiliary hidden states")
+            verification_logits = self.model.lm_head(
+                target_output.hidden_states,
+                return_all_logits=True,
+            )
+            verification_auxiliary = target_output.auxiliary_hidden_states
+        finally:
+            reset_context()
+        self._finish_spec_timing("verify", verify_started)
+
+        sampling_started = self._begin_spec_timing()
+        result = self.rank_verifier(
+            proposal,
+            verification_logits,
+            temperatures,
+            verify_row_indices,
+        )
+        target_tables = [
+            seq.block_table + (reservation.target_block_ids or reservation.new_block_ids)
+            for seq, reservation in zip(seqs, reservations)
+        ]
+        try:
+            stager.commit_path(
+                topologies,
+                [path or [] for path in result.accepted_paths or []],
+                [len(seq) for seq in seqs],
+                target_tables,
+                self.block_size,
+            )
+            self.eagle3_proposer.commit_tree(
+                seqs,
+                verification_auxiliary,
+                result,
+                topologies,
+                verify_row_indices,
+                [
+                    len(seq) + accepted_count
+                    for seq, accepted_count in zip(seqs, result.accepted_draft_counts)
+                ],
+                target_tables,
+            )
+        finally:
+            stager.release()
+        self._finish_spec_timing("sampling", sampling_started)
+        return result
+
+    @torch.inference_mode()
     def run_eagle3_spec_decode(
         self,
         seqs: list[Sequence],
@@ -576,6 +802,14 @@ class ModelRunner:
             temperatures,
         )
         self._finish_spec_timing("draft", draft_started)
+        if proposal.tree_topologies is not None:
+            return proposal, self._run_eagle3_tree_verify(
+                seqs,
+                reservations,
+                proposal,
+                temperatures,
+            )
+
         verify_started = self._begin_spec_timing()
         prepared = self.prepare_spec_decode(
             seqs,

@@ -156,7 +156,7 @@ class BlockManager:
         return covered_tokens - len(seq) + len(self.free_block_ids) * self.block_size
 
     def reserve_spec_append(self, seq: Sequence, num_tokens: int) -> list[int]:
-        num_required_blocks = (len(seq) + num_tokens + self.block_size - 1) // self.block_size - len(seq.block_table)
+        num_required_blocks = self.num_spec_append_blocks(seq, num_tokens)
         if num_required_blocks <= 0:
             return []
         if len(self.free_block_ids) < num_required_blocks:
@@ -168,6 +168,36 @@ class BlockManager:
             self._allocate_block(block_id)
             new_block_ids.append(block_id)
         return new_block_ids
+
+    def num_spec_append_blocks(self, seq: Sequence, num_tokens: int) -> int:
+        """Return the number of primary-cache blocks needed for an append."""
+        return max(
+            0,
+            (len(seq) + num_tokens + self.block_size - 1) // self.block_size
+            - len(seq.block_table),
+        )
+
+    def reserve_blocks(self, count: int) -> list[int]:
+        """Reserve unstructured blocks for transient Draft COW state."""
+        if count < 0:
+            raise ValueError("block reservation count must be non-negative")
+        if len(self.free_block_ids) < count:
+            raise RuntimeError("Insufficient KV cache capacity for block reservation.")
+        block_ids = []
+        for _ in range(count):
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            block_ids.append(block_id)
+        return block_ids
+
+    def release_blocks(self, block_ids: list[int]) -> None:
+        """Release a transient reservation that was never added to a sequence."""
+        for block_id in block_ids:
+            block = self.blocks[block_id]
+            if block.ref_count != 1:
+                raise ValueError("transient block is not exclusively reserved")
+            block.ref_count = 0
+            self._deallocate_block(block_id)
 
     def commit_spec_append(
         self,

@@ -14,6 +14,9 @@ class SpeculativeConfig:
     prompt_lookup_max: int = 2
     prompt_lookup_min: int = 1
     draft_model: str | None = None
+    tree_top_k: int = 1
+    tree_max_depth: int = 0
+    tree_prune_ratio: float = 0.0
     draft_hf_config: AutoConfig | None = field(init=False, default=None)
     auxiliary_layer_ids: tuple[int, ...] = field(init=False, default=())
 
@@ -34,6 +37,21 @@ class SpeculativeConfig:
                 "num_speculative_tokens expected at least 1, "
                 f"got {self.num_speculative_tokens}"
             )
+        if self.tree_top_k < 1:
+            raise ValueError(f"tree_top_k expected at least 1, got {self.tree_top_k}")
+        if not 0.0 <= self.tree_prune_ratio <= 1.0:
+            raise ValueError(
+                "tree_prune_ratio expected in [0, 1], "
+                f"got {self.tree_prune_ratio}"
+            )
+        if self.tree_top_k > 1:
+            if self.method != "eagle3":
+                raise ValueError("tree_top_k > 1 requires method='eagle3'")
+            if self.tree_max_depth < 1:
+                raise ValueError(
+                    "tree_max_depth expected at least 1 in tree mode, "
+                    f"got {self.tree_max_depth}"
+                )
 
 @dataclass
 class Config:

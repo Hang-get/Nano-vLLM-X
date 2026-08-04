@@ -29,6 +29,16 @@ class Scheduler:
             if config.speculative_config is not None
             else 0
         )
+        self.tree_top_k = (
+            config.speculative_config.tree_top_k
+            if config.speculative_config is not None
+            else 1
+        )
+        self.tree_max_depth = (
+            config.speculative_config.tree_max_depth
+            if config.speculative_config is not None
+            else 0
+        )
         self._num_accepted_draft_tokens = 0
         self._num_proposed_draft_tokens = 0
         self._num_spec_decode_requests = 0
@@ -139,14 +149,26 @@ class Scheduler:
         for seq in seqs:
             remaining_output_budget = seq.max_tokens - seq.num_completion_tokens
             remaining_context = self.max_model_len - len(seq)
-            requested = max(
-                0,
-                min(
-                    self.num_speculative_tokens,
-                    remaining_output_budget - 1,
-                    remaining_context,
-                ),
-            )
+            if self.tree_top_k > 1:
+                # Tree depth includes the pending root. A path with D layers
+                # can accept at most D - 1 Draft nodes and emits one bonus.
+                requested = max(
+                    1,
+                    min(
+                        self.tree_max_depth,
+                        remaining_output_budget,
+                        remaining_context + 1,
+                    ),
+                )
+            else:
+                requested = max(
+                    0,
+                    min(
+                        self.num_speculative_tokens,
+                        remaining_output_budget - 1,
+                        remaining_context,
+                    ),
+                )
             requested_lengths.append(requested)
         return requested_lengths
 
@@ -155,6 +177,9 @@ class Scheduler:
         seqs: list[Sequence],
         requested_lengths: list[int],
     ) -> list[SpecReservation]:
+        if self.speculative_method == "eagle3" and self.tree_top_k > 1:
+            return self._reserve_tree_spec_budget(seqs, requested_lengths)
+
         reservations = []
         for seq, requested in zip(seqs, requested_lengths):
             draft_len = min(
@@ -168,6 +193,57 @@ class Scheduler:
                         seq,
                         draft_len,
                     ),
+                )
+            )
+        return reservations
+
+    def _tree_node_count(self, depth: int) -> int:
+        if depth <= 0:
+            return 0
+        # `depth` counts the root, so only levels 1..depth-1 are Draft nodes.
+        return sum(self.tree_top_k**level for level in range(1, depth))
+
+    def _reserve_tree_spec_budget(
+        self,
+        seqs: list[Sequence],
+        requested_lengths: list[int],
+    ) -> list[SpecReservation]:
+        """Reserve separate Target append and Draft COW pools per request."""
+        reservations = []
+        for seq, requested in zip(seqs, requested_lengths):
+            requested_depth = min(self.tree_max_depth, requested)
+            max_appendable = self.block_manager.get_num_appendable_tokens(seq)
+            # Depth includes root; only depth - 1 Target positions are appended.
+            max_tree_depth = max_appendable + 1
+            requested_depth = min(requested_depth, max_tree_depth)
+            effective_depth = requested_depth
+            while effective_depth > 0:
+                target_count = self.block_manager.num_spec_append_blocks(
+                    seq, max(effective_depth - 1, 0)
+                )
+                draft_count = self._tree_node_count(effective_depth)
+                if len(self.block_manager.free_block_ids) >= target_count + draft_count:
+                    break
+                effective_depth -= 1
+
+            target_block_ids = self.block_manager.reserve_spec_append(
+                seq, max(effective_depth - 1, 0)
+            )
+            try:
+                draft_block_ids = self.block_manager.reserve_blocks(
+                    self._tree_node_count(effective_depth)
+                )
+            except Exception:
+                self.block_manager.release_blocks(target_block_ids)
+                raise
+            reservations.append(
+                SpecReservation(
+                    draft_len=self._tree_node_count(effective_depth),
+                    new_block_ids=target_block_ids,
+                    max_path_draft_len=max(effective_depth - 1, 0),
+                    effective_tree_max_depth=effective_depth,
+                    draft_block_ids=draft_block_ids,
+                    target_block_ids=target_block_ids,
                 )
             )
         return reservations
@@ -193,6 +269,32 @@ class Scheduler:
             for reservation in reservations
         ]
         return reserved_draft_token_ids, legacy_reservations
+
+    def release_unused_tree_draft_blocks(
+        self,
+        reservations: list[SpecReservation],
+        proposal: DraftProposal,
+    ) -> None:
+        """Return COW blocks pruned before Target verification begins."""
+        unused_per_request = proposal.unused_draft_block_ids
+        if unused_per_request is None:
+            return
+        if len(unused_per_request) != len(reservations):
+            raise ValueError("unused Draft block batch size mismatch")
+        for reservation, unused in zip(reservations, unused_per_request):
+            if not unused:
+                continue
+            if reservation.draft_block_ids is None:
+                raise ValueError("tree reservation has no Draft block pool")
+            reserved = set(reservation.draft_block_ids)
+            if len(set(unused)) != len(unused) or not set(unused) <= reserved:
+                raise ValueError("unused Draft blocks are outside the reservation")
+            self.block_manager.release_blocks(unused)
+            reservation.draft_block_ids[:] = [
+                block_id
+                for block_id in reservation.draft_block_ids
+                if block_id not in set(unused)
+            ]
 
     def postprocess_spec_decode(
         self,
@@ -262,7 +364,7 @@ class Scheduler:
             self._num_accepted_draft_tokens += num_appended_accepted_drafts
             num_computed_tokens = old_len + num_appended_accepted_drafts
             new_block_ids = (
-                reservation.new_block_ids
+                (reservation.target_block_ids or reservation.new_block_ids)
                 if isinstance(reservation, SpecReservation)
                 else reservation["new_block_ids"]
             )
@@ -273,6 +375,9 @@ class Scheduler:
                 num_computed_tokens,
             )
             seq.num_computed_tokens = num_computed_tokens
+
+            if isinstance(reservation, SpecReservation) and reservation.draft_block_ids:
+                self.block_manager.release_blocks(reservation.draft_block_ids)
 
             if seq.is_finished:
                 self.block_manager.deallocate(seq)

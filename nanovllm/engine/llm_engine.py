@@ -58,11 +58,28 @@ class LLMEngine:
         elif not is_prefill and self.scheduler.speculative_method == "eagle3":
             requested = self.scheduler.get_eagle3_requested_lengths(seqs)
             reservations = self.scheduler.reserve_spec_budget(seqs, requested)
-            proposal, result = self.model_runner.call(
-                "run_eagle3_spec_decode",
-                seqs,
-                reservations,
-            )
+            if self.scheduler.tree_top_k > 1:
+                proposal = self.model_runner.call(
+                    "run_eagle3_tree_propose",
+                    seqs,
+                    reservations,
+                )
+                self.scheduler.release_unused_tree_draft_blocks(
+                    reservations,
+                    proposal,
+                )
+                result = self.model_runner.call(
+                    "run_eagle3_tree_verify",
+                    seqs,
+                    reservations,
+                    proposal,
+                )
+            else:
+                proposal, result = self.model_runner.call(
+                    "run_eagle3_spec_decode",
+                    seqs,
+                    reservations,
+                )
             num_decode_tokens = self.scheduler.postprocess_spec_decode(
                 seqs,
                 result,
