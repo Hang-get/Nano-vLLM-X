@@ -16,6 +16,7 @@ from nanovllm.v1.spec_decode.types import (
 class RecordingTargetModel:
     def __init__(self, events):
         self.events = events
+        self.inference_modes = []
         self.lm_head = self
 
     def __call__(
@@ -27,6 +28,7 @@ class RecordingTargetModel:
     ):
         if return_all_logits:
             return torch.zeros((input_ids.size(0), 7))
+        self.inference_modes.append(torch.is_inference_mode_enabled())
         self.events.append("target_with_aux")
         rows = input_ids.numel()
         hidden = torch.arange(rows * 2, dtype=torch.float32).reshape(rows, 2)
@@ -41,13 +43,17 @@ class RecordingProposer:
         self.events = events
         self.proposal = proposal
         self.commits = []
+        self.prefill_inference_modes = []
+        self.propose_inference_modes = []
 
     def prefill(self, seqs, auxiliary, target_lengths):
+        self.prefill_inference_modes.append(torch.is_inference_mode_enabled())
         self.events.append("draft_prefill_and_store_anchor")
         assert [rows.size(0) for rows in auxiliary] == [len(seq) for seq in seqs]
         assert target_lengths == [len(seq) for seq in seqs]
 
     def propose(self, seqs, reservations, temperatures):
+        self.propose_inference_modes.append(torch.is_inference_mode_enabled())
         self.events.append("draft_propose")
         return self.proposal
 
@@ -124,6 +130,8 @@ def test_runner_eagle3_prefill_orders_target_draft_and_root_sampling(monkeypatch
         "draft_prefill_and_store_anchor",
         "sample_root",
     ]
+    assert runner.model.inference_modes == [True]
+    assert runner.eagle3_proposer.prefill_inference_modes == [True]
 
 
 @pytest.mark.parametrize("accepted_count", [0, 1, 2])
@@ -168,6 +176,8 @@ def test_runner_eagle3_verify_commits_anchor_by_explicit_accepted_count(
         "rejection_sample",
         "select_next_anchor",
     ]
+    assert proposer.propose_inference_modes == [True]
+    assert runner.model.inference_modes == [True]
     auxiliary, accepted, target_lengths, selected = proposer.commits[0]
     assert accepted == [accepted_count]
     assert target_lengths == [3 + accepted_count]
@@ -175,6 +185,34 @@ def test_runner_eagle3_verify_commits_anchor_by_explicit_accepted_count(
         selected[0],
         auxiliary[0][accepted_count],
     )
+
+
+def test_eagle3_draft_warmup_uses_inference_mode():
+    class RecordingDraft:
+        def combine_hidden_states(self, hidden):
+            assert torch.is_inference_mode_enabled()
+            return hidden[:, :2]
+
+        def __call__(self, input_ids, positions, hidden):
+            assert torch.is_inference_mode_enabled()
+            return hidden, hidden
+
+        def compute_logits(self, hidden):
+            assert torch.is_inference_mode_enabled()
+            return torch.zeros((hidden.size(0), 7))
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.draft_model = RecordingDraft()
+    runner.eagle3_proposer = SimpleNamespace(
+        states={
+            1: SimpleNamespace(
+                anchor_hidden_states=torch.zeros(6),
+                draft_num_computed_tokens=2,
+            )
+        }
+    )
+
+    runner._warmup_eagle3_draft_step([FakeSequence(1, [1, 2, 3], 2)])
 
 
 class RecordingEngineRunner:

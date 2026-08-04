@@ -155,6 +155,7 @@ class ModelRunner:
             self.run(seqs, True)
         torch.cuda.empty_cache()
 
+    @torch.inference_mode()
     def _warmup_eagle3_draft_step(self, seqs: list[Sequence]) -> None:
         if self.eagle3_proposer is None or self.draft_model is None:
             raise RuntimeError("EAGLE3 draft model is not initialized")
@@ -523,6 +524,7 @@ class ModelRunner:
         reset_context()
         return verified_token_ids
 
+    @torch.inference_mode()
     def run_eagle3_prefill(self, seqs: list[Sequence]) -> list[int] | None:
         if self.eagle3_proposer is None:
             raise RuntimeError("EAGLE3 proposer is not initialized")
@@ -556,6 +558,7 @@ class ModelRunner:
         assert temperatures is not None
         return self.sampler(logits, temperatures).tolist()
 
+    @torch.inference_mode()
     def run_eagle3_spec_decode(
         self,
         seqs: list[Sequence],
