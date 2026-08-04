@@ -224,10 +224,30 @@ Copy-on-Write 下，不能简单按 `ceil(node_count / block_size)` 估算 block
 
 简化公式：`预留 blocks = max_draft_nodes`（每节点可能触发一次 COW）。
 
-**实现**：
-- Scheduler 预分配 `max_draft_nodes` 个 block，不依赖 COW 复用的乐观假设
-- 生成完成后，实际使用的 block 保留，未使用的归还 block manager
-- 如果 block 不足以满足最大预留 → 逐级减小 `max_depth`（例如 depth 4→3，节点数从 39 降到 12）
+**这是 Draft KV block，不是 Target 主 KV block**。Target KV 中 tree tokens 不持久化（见 Section 7.5），无需为它们额外预留 Target block。`SpecReservation.new_block_ids` 原语义是线性追加 Target block，树形模式下需改为 Draft KV block 池：
+
+```python
+# 树形模式下的 SpecReservation
+SpecReservation(
+    draft_len=...,
+    new_block_ids=[...]   # Draft KV blocks，由 TreeDraftKVManager 管理
+)
+# 这些 block 不按 position // block_size 解释，而是作为 COW 存储池
+# TreeDraftKVManager 从中分配 block，每个 tree node 可能独占一个 block
+```
+
+**降级必须发生在 Draft 生成前**。如果预留 block 不足，降级需**同步更新**以下所有组件：
+
+```
+depth 4 → 3 降级需要同步：
+  ✓ reservation.draft_len  → 更新为新深度的节点数
+  ✓ proposer 的 max_depth  → 传入更新后的值
+  ✓ TreeTopology            → 构建时使用新深度
+  ✓ proposal.lengths        → 生成后与新深度一致
+  ✓ scheduler commit/release → 按更新后的 reservation 操作
+```
+
+不一致示例（必须避免）：reservation 只有 13 个 block，但 topology 仍返回 39 个节点的状态。
 
 ## 7. Target 验证：Tree Attention Mask
 
@@ -310,29 +330,29 @@ Tree token KV **不写入主 target KV cache**（因为多数会被拒绝）。�
 
 ### 7.5 Attention 模块修改
 
-`Attention.forward()` 新增 `tree_verify` 分支：
+`Attention.forward()` 新增 `tree_verify` 分支，**按 token 类型区分 store 策略**：
 
 ```python
 def forward(self, q, k, v):
     context = get_context()
     if context.is_tree_verify:
-        # 跳过 store_kvcache (tree tokens 的 KV 不持久化)
+        # root row: store 到 cache (slot_mapping[root] = 有效位置)
+        # tree rows: slot_mapping = -1, 跳过 store_kvcache
+        store_kvcache(k[:1], v[:1], self.k_cache, self.v_cache, context.slot_mapping[:1])
         return self._tree_attention(q, k, v)
     elif context.is_prefill:
-        store_kvcache(k, v, self.k_cache, self.v_cache, context.slot_mapping)
         # ... 不变
     else:
-        # decode: store_kvcache 已有，不变
+        # decode: 不变
         ...
 
 def _tree_attention(self, q, k, v):
     # 1. gather prompt KV from cache (每层)
     # 2. concat [K_prompt, K_tree], [V_prompt, V_tree]
     # 3. F.scaled_dot_product_attention(Q_tree, K_full, V_full, attn_mask=tree_mask)
-    # 注意: K_tree = k, V_tree = v (来自当前层的投影，不存 cache)
 ```
 
-> 关键区别：`tree_verify` 分支**不调用** `store_kvcache`，tree tokens 的 K/V 仅在 attention 计算中使用。
+> 关键区别：`tree_verify` 分支对 root row **写入** target cache（避免下一轮重复计算）；对 tree rows **跳过** store（多数会被拒绝，不污染 cache）。`slot_mapping` 的前 1 行（root）= 有效 slot，后续行 = -1。
 
 ### 7.6 Prompt KV Gather 说明
 
@@ -430,33 +450,62 @@ while True:
 
 ### 8.4 Root Logits 获取
 
-排名验证的第一步需要大模型在 **root 节点**（pending_root）处的 target 分布来进行采样。Root 的 KV 已在 prompt cache 中，但它的 logits 需要在本轮树验证中显式计算。
+排名验证的第一步需要大模型在 **root 节点**（pending_root）处的 target 分布来进行采样。
 
-**解法：将 pending_root 作为 tree 验证输入的额外 query row**
+**解法：将 pending_root 作为 tree 验证输入的第一个 query row，在同一轮 Target forward 中显式计算其 logits。**
+
+**输入结构**：
 
 ```
 tree 验证输入 = [pending_root_id, draft_depth1_nodes..., draft_depth2_nodes...]
-                 ^                                    ^
-               root query row                     draft 节点的 query rows
+                 ^                                   ^
+              root query row                   draft query rows (BFS 顺序)
 ```
 
-- pending_root 作为树的第一个 query token（depth=0），在 tree attention 中 attend 到 **prompt[0..P-2] + 自己**（root 不在 prompt cache 部分重复出现）
-- 大模型通过 tree attention 处理 pending_root，产出隐藏状态 → logits → **这就是 root 处的 target 分布**
-- 后续 draft 节点按 BFS 顺序排列，attend 到 prompt + 祖先
-
-**Attention mask 构造调整**：
+**Attention mask 硬约束**：
 
 ```
-prompt K/V: gather cache[0..P-2]  （排除 pending_root 的最后位置）
-tree K/V: [K_root, K_d0, K_d1, ...]  （含 root）
+K_full = prompt[0..P-2] + [K_root, K_draft...]
 
-Mask (root query row):
-  prompt[0..P-2]: True
-  tree position 0 (root): True
-  其他 tree positions: False
+mask 必须满足:
+  - root row:   prompt[0..P-2] = True,  root K = True,  其他 tree K = False
+  - draft rows: prompt[0..P-2] = True,  root K = True,  祖先 K = True, 兄弟 K = False
+  - root 的 K 不出现在 prompt[0..P-2] 中（已排除 P-1 位置）
 ```
 
-这样 root 不会在 prompt cache 和 tree KV 中重复出现，避免了 attention 中的重复 K 条目。
+**位置编号**：
+```
+prompt tokens:   [0, 1, ..., P-2]        (共 P-1 个)
+root (tree):     逻辑位置 P-1            (query row index 0 in tree input)
+draft depth=1:   逻辑位置 P, P+1, ...    (对应 BFS indices)
+draft depth=2:   逻辑位置 P+?, ...       (按 BFS 顺序递增)
+```
+
+**不可以直接用 `prompt_len + depth` 套在"排除 root 后的 prompt 长度"上**，否则会产生一位偏移。必须明确 root 的逻辑位置就是 P-1。
+
+**Root K/V 持久化策略**：
+
+| token | cache slot | 说明 |
+|-------|-----------|------|
+| root (pending_root) | **有效 slot** (P-1) | root 是本轮一定会保留的 token，应在本轮写入 target KV cache |
+| draft tree nodes | **slot = -1** | 多数会被拒绝，不写入 target cache |
+
+`slot_mapping` 必须区分对待：
+```
+root row:    块表[ (P-1) // block_size ] * block_size + (P-1) % block_size
+tree rows:   -1 (跳过 store_kvcache)
+```
+
+**verify_rows 结构**：
+
+树形验证产出的 logits 顺序必须是：
+```
+verify_logits = [root_logits | draft_node0_logits | ... | draft_nodeN_logits | bonus_logits]
+                   ↑              ↑                           ↑               ↑
+              用于排名验证第1步   用于后续各层验证            每节点1行        末尾bonus行
+```
+
+rank verifier 依赖这个顺序将 root logits 与第一层候选对应，将每个 tree node 的 logits 与其子节点候选对应。
 
 ### 8.5 为什么不能用 bonus row
 
