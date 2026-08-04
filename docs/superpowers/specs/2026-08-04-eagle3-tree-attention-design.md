@@ -8,7 +8,7 @@
 
 在现有线性 EAGLE3 推测解码基础上，实现**树形候选生成 + 统一验证**的 TreeAttention 功能。
 
-核心变更：Draft model 每步采样 **top-k** 个候选 token（而非 greedy 1 个），形成 token 树；Target model 在**一次 forward** 中使用自定义 attention mask 验证所有树节点；rejection sampling 在树上递归游走选择最优路径。
+核心变更：Draft model 每步采样 **top-k** 个候选 token（而非 greedy 1 个），形成 token 树；Target model 在**一次 forward** 中使用自定义 attention mask 验证所有树节点；采用 **排名接受**（rank-based acceptance）在树上递归游走选择最优路径——大模型从自身分布采样，若采样 token 落在草稿模型的 top-L 候选集合中即接受。
 
 通过 `top_k=1` 自然回退到当前线性模式，确保向后兼容。
 
@@ -137,11 +137,13 @@ def propose(seqs, reservations, temperatures) -> DraftProposal:
 @dataclass
 class DraftProposal:
     token_ids: list[list[int]]          # 树形: BFS 平整化的 draft tokens
-    probabilities: torch.Tensor         # 所有 draft token 的 prob (BFS 顺序)
+    probabilities: torch.Tensor         # draft token 的 prob (BFS 顺序)
+                                         # 用途: 仅用于 draft 阶段的 top-k 选择
+                                         # 排名验证不需要此字段
     lengths: list[int]                  # draft token 总数
     tree_topologies: list[TreeTopology | None]  # None = 线性模式
 
-@dataclass  
+@dataclass
 class SpecDecodeResult:
     output_token_ids: list[list[int]]
     accepted_draft_counts: list[int]
@@ -335,7 +337,9 @@ prompt_block_table: torch.Tensor      # 用于 gather: [num_prompt_blocks]
 prompt_seq_len: int                   # prompt token 数量
 ```
 
-## 8. 树形 Rejection Sampling
+## 8. 树形排名验证（Rank-based Acceptance）
+
+采用 EAGLE-2 风格的排名接受机制，**不依赖草稿模型的概率值**进行验证。
 
 ### 8.1 算法
 
@@ -344,39 +348,46 @@ prompt_seq_len: int                   # prompt token 数量
 ```
 accepted = []
 node = root
-while node is not rejected:
-    # 检查当前节点的所有子节点
-    accepted_children = []
-    for child in node.children:
-        if target_prob[child] / draft_prob[child] >= rand():
-            accepted_children.append(child)
-    
-    if not accepted_children:
-        # 全部拒绝 → 从 target 采样 recovery token
-        recovery = sample(target_logits[node] - draft_probs[children])
-        accepted.append(recovery)
-        break
-    
-    # 在接受的子节点中随机选择一个（按 target_prob 加权）
-    child = categorical_sample(target_probs[accepted_children])
-    accepted.append(child.token)
-    node = child  # 继续向下
 
-# 如果到达叶子节点 → bonus token
-if node.is_leaf and node.was_accepted:
-    accepted.append(target_bonus_token)
+while True:
+    # 从大模型在当前节点的真实分布中采样一个 token
+    sampled_token = sample(target_logits[node])  # 带 temperature
+
+    # 检查采样出的 token 是否落在草稿树当前节点的子节点集合中
+    children_tokens = {child.token for child in node.children}
+    if sampled_token in children_tokens:
+        # 接受：找到对应的子节点，沿该分支继续
+        accepted_child = node.children[find(child.token == sampled_token)]
+        accepted.append(accepted_child.token)
+        node = accepted_child
+    else:
+        # 拒绝：采样出的 token 不在任何子节点中
+        # 该 token 本身就是 recovery token，验证在此层终止
+        accepted.append(sampled_token)
+        break
+
+    # 如果到达叶子节点且仍在接受 → bonus token
+    if not node.children:
+        bonus = sample(target_logits[node])
+        accepted.append(bonus)
+        break
 ```
 
-### 8.2 与线性版的差异
+### 8.2 与线性版/原拒接采样版的差异
 
-| 方面 | 线性版 | 树形版 |
-|------|--------|--------|
+| 方面 | 线性拒绝采样 | 树形排名验证 |
+|------|------------|------------|
 | 遍历方式 | 顺序 for 循环 | 根→叶递归 |
-| 接受条件 | 单 token vs 随机数 | 兄弟并行检查，按概率选一个 |
-| 拒绝恢复 | sample(target - draft) | 同上 |
-| Bonus token | 所有 K 个全接受时 | 到达叶节点继续接受时 |
+| 接受条件 | `target_prob / draft_prob >= rand()` | 大模型采样 token ∈ draft 的 top-L 集合 |
+| 是否用 draft 概率 | **是** | **否** |
+| 拒绝恢复 | `sample(target - draft)` | 采样出的 token 即是输出 |
+| Bonus token | 所有 K 个全接受时 | 到达叶节点且仍被接受时 |
 
-线性回退：`top_k=1` → 每个节点只有 1 个子节点 → 退化为顺序扫描。
+### 8.3 关键性质
+
+- **分布等价性**：只要草稿模型提供的 top-L 集合包含了大模型会采样的 token，接受路径就能继续。最终输出分布与大模型真实分布一致（数学上可证）。
+- **对概率值不敏感**：草稿模型只需要输出正确的**相对排名**（top-L 集合），不需要精确概率。训练和使用更加友好。
+- **线性回退**：`top_k=1` → 每个节点只有 1 个子节点 → 退化为"大模型每步采样是否恰好等于草稿模型预测"的单链验证。
 
 ## 9. Model Runner 集成
 
@@ -418,10 +429,10 @@ def prepare_spec_decode(seqs, draft_token_ids, reservations,
 def run_eagle3_spec_decode(seqs, reservations):
     # 1. Draft proposal
     proposal = proposer.propose(...)
-    
-    # 2. Target verification
+
+    # 2. Target verification (forward + get logits)
     if proposal.tree_topologies:
-        # 树形路径: 使用 padding-batched flash_attn_func (不用 cu_seqlens)
+        # 树形路径: 使用 padding-batched SDPA (不用 cu_seqlens)
         prepared = prepare_spec_decode(seqs, proposal, reservations,
                                        proposal.tree_topologies, include_query_lengths=True)
         input_ids, positions, verify_rows, tree_masks, query_lens = prepared
@@ -431,11 +442,14 @@ def run_eagle3_spec_decode(seqs, reservations):
     else:
         # 线性路径：现有行为不变（cu_seqlens + flash_attn_varlen_func）
         ...
-    
-    # 3. Rejection sampling
-    result = rejection_sampler(proposal, verify_logits, tree_topologies)
-    # 树形: result 额外包含 accepted_path (树中接受路径的节点索引列表)
-    
+
+    # 3. Rank-based 验证 (替代 rejection sampling)
+    # 大模型从 logits 采样，检查是否在 draft 的 top-L 集合中
+    # 不需要 draft_probs 参数
+    result = rank_verifier(proposal=proposal,
+                            target_logits=verification_logits,
+                            temperatures=temperatures)
+
     # 4. Commit
     # 树形: 接受路径上的 tokens 通过后续正常 decode 写入 KV cache
     #       draft KV manager 释放非接受分支的 copy-on-write blocks
@@ -452,7 +466,7 @@ def run_eagle3_spec_decode(seqs, reservations):
 | `v1/spec_decode/types.py` | 新增 `TreeTopology`，扩展 `DraftProposal` | 低 |
 | `v1/spec_decode/eagle3_proposer.py` | `propose()` top-k 生成 + copy-on-write KV 管理 | **高** |
 | `engine/model_runner.py` | `prepare_spec_decode()`, `run_eagle3_spec_decode()` 树形分支 | 高 |
-| `v1/sample/rejection_sampler.py` | 线性扫描 → 树形递归游走 | 中 |
+| `v1/sample/rejection_sampler.py` | 新增 `RankVerifier` 类（排名验证）; 原有 `RejectionSampler` 保留不变 | 中 |
 | `engine/scheduler.py` | block 预留量适配树节点数 | 低 |
 | `tests/` | 新增 tree attention 相关测试 | - |
 
@@ -474,7 +488,7 @@ def run_eagle3_spec_decode(seqs, reservations):
 
 1. **树形拓扑正确性**：验证 BFS 线性化、mask 构建、position 分配的数学正确性
 2. **Copy-on-Write 正确性**：验证 fork/write/commit 后 KV block 引用计数和内容正确
-3. **概率分布验证**：树形 rejection sampling 与线性版的概率一致性（top_k=1 时输出相同）
+3. **排名验证正确性**：树形排名验证的分布等价性（top_k=1 时与线性版输出一致，top_k>1 时接受率提升）
 4. **集成测试**：Qwen3-4B + EAGLE3 checkpoint，树形 vs 线性接受率对比
 5. **边界条件**：空树、单节点树、max_depth 截断、batch 混合（树形+线性）
 
@@ -486,5 +500,5 @@ def run_eagle3_spec_decode(seqs, reservations):
 | batch 内混合树形/线性 | 通过 `tree_topologies` 的 per-sequence None/非None 区分。线性序列走原代码路径，树形序列走新路径 |
 | 相同 position 不同分支的 RoPE | 已验证可行：tree mask 隔离互不可见，RoPE 的同 position 编码不影响注意力计算结果 |
 | 树节点数 > 预留 block 容量 | scheduler 预留阶段检查，不足时 fallback 到线性模式 |
-| 树的 leaf 节点在非最大深度被截断 | 正常流程：leaf 的 `children=[]`，rejection sampling 在此处自然终止 |
+| 树的 leaf 节点在非最大深度被截断 | 正常流程：leaf 的 `children=[]`，排名验证在此处自然终止 |
 | Draft KV cache 全满 | 与当前线性版行为一致：拒绝生成更多 draft，`max_depth` 截断 |
