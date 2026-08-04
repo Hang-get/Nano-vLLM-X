@@ -198,27 +198,36 @@ class TreeDraftKVManager:
 
 ### 6.3 Block 预留
 
-`SpecReservation.new_block_ids` 预留量从 `K`（线性）变为树节点数。由于动态修剪，**实际节点数在生成完成后才知道**，但 scheduler 必须在生成前分配 blocks。
+由于动态修剪，树的实际节点数在生成完成后才知道，但 scheduler 必须在生成前分配 blocks。
 
-**策略：按最大节点数预留，生成后释放未使用的 blocks**
+**策略：按最大节点数预留 blocks，生成后释放未使用的**
 
 ```
-最大节点数 = sum_{d=0}^{max_depth-1} top_k^d
+最大 draft 节点数（不含 root）= sum_{d=1}^{max_depth-1} top_k^d
 ```
 
-例：`top_k=2, max_depth=4, prune_ratio=0.05` → 预留 max 15 节点（约 1 block）。动态修剪后实际树可能只有 5-10 节点，多余 block 在验证后释放。
+**COW 对 block 数量的影响**：
 
-**为什么按最大预留是合理的**：
-- 树节点数有限（top_k=3, depth=4 → 40 节点 ≈ 1 block），预留开销极小
-- 如果预留阶段 block 不足以满足最大节点数 → fallback 到 `max_depth-1` 或线性模式
-- 生成完成后，实际使用的 block 保留，未使用的归还给 block manager
+Copy-on-Write 下，不能简单按 `ceil(node_count / block_size)` 估算 block 数量。多个分支共享同一个父节点 block 时，每个子分支的首次写入都会触发 COW，产生新 block。
 
-```python
-def reserve_spec_budget(seq, tree_config):
-    max_nodes = sum(tree_config.top_k ** d for d in range(tree_config.max_depth))
-    # allocate max_nodes worth of blocks
-    # after generation: release (max_nodes - actual_nodes) worth of blocks
+最坏情况：每个 draft 节点的首次写入都触发 COW → 需要的 block 数 = draft 节点数。
+
 ```
+示例: top_k=3, depth=4（4层含root）
+  root:           已有 1 block（不计入预留）
+  depth=1: top_k=3, 最坏 3 个 COW blocks
+  depth=2: top_k^2=9, 最坏 9 个 COW blocks  
+  depth=3: top_k^3=27, 最坏 27 个 COW blocks
+  -----------------
+  总计: 最多 39 个 draft blocks 需要预留
+```
+
+简化公式：`预留 blocks = max_draft_nodes`（每节点可能触发一次 COW）。
+
+**实现**：
+- Scheduler 预分配 `max_draft_nodes` 个 block，不依赖 COW 复用的乐观假设
+- 生成完成后，实际使用的 block 保留，未使用的归还 block manager
+- 如果 block 不足以满足最大预留 → 逐级减小 `max_depth`（例如 depth 4→3，节点数从 39 降到 12）
 
 ## 7. Target 验证：Tree Attention Mask
 
@@ -233,31 +242,32 @@ def reserve_spec_budget(seq, tree_config):
 ### 7.2 每层 Attention 计算流程
 
 ```
-输入: x_tree = [N, dim]  (tree draft tokens 的 hidden states, 不含 root)
+输入: x_tree = [N+1, dim]  (pending_root + N个 draft tokens 的 hidden states)
 
-1. Gather prompt KV from paged cache:
-   K_prompt = gather(k_cache[layer], block_table)  # [P, kv_heads, dim]
-   V_prompt = gather(v_cache[layer], block_table)
+1. Gather prompt KV (排除 root 的最后位置避免重复):
+   K_prompt = gather(k_cache[layer], block_table[0..P-2])  # [P-1, kv_heads, dim]
+   V_prompt = gather(v_cache[layer], block_table[0..P-2])
 
-2. Compute tree KV from current input (不写入 cache):
-   K_tree = W_K @ x_tree  # [N, kv_heads, dim]
-   V_tree = W_V @ x_tree  # [N, kv_heads, dim]
-   # 注意: 此处 store_kvcache 被跳过，tree tokens 的 KV 不持久化
+2. Compute tree KV (不写入 cache):
+   K_tree = W_K @ x_tree  # [N+1, kv_heads, dim]  (含 root)
+   V_tree = W_V @ x_tree  # [N+1, kv_heads, dim]
 
 3. Concat + build mask:
-   K_full = cat[K_prompt, K_tree]  # [P+N, kv_heads, dim]
+   K_full = cat[K_prompt, K_tree]  # [(P-1)+(N+1), kv_heads, dim]
    V_full = cat[V_prompt, V_tree]
 
-   full_mask[0:P, 0:P] = causal (lower triangular)    # prompt 内部
-   full_mask[P:P+N, 0:P] = True (tree→prompt: all)    # tree 可以看到所有 prompt
-   full_mask[P:P+N, P:P+N] = tree_mask (ancestor-only) # tree 内部只有祖先行
+   full_mask[0:P-1, 0:P-1] = causal        # prompt 内部
+   full_mask[P-1:P+N, 0:P-1] = True        # tree→prompt: all
+   full_mask[P-1, P-1] = True              # root→root: self only
+   full_mask[P-1, P:] = False               # root→其他tree: none
+   full_mask[P:P+N, P-1:P+N] = tree_mask    # draft→tree: ancestor-only
 
-4. PyTorch SDPA (自动 dispatch 到最优后端):
+4. PyTorch SDPA:
    o = F.scaled_dot_product_attention(
-       Q_tree,           # [N, q_heads, dim]
-       K_full,           # [P+N, kv_heads, dim]
-       V_full,           # [P+N, kv_heads, dim]
-       attn_mask=full_mask[P:P+N, :],  # boolean mask
+       Q_tree,           # [N+1, q_heads, dim]  (含 root query)
+       K_full,           # [P-1+N+1, kv_heads, dim]
+       V_full,           # [P-1+N+1, kv_heads, dim]
+       attn_mask=full_mask[P-1:P+N, :],
        scale=self.scale,
    )
 ```
@@ -269,22 +279,21 @@ def reserve_spec_budget(seq, tree_config):
 ### 7.3 Mask 示意
 
 ```
-prompt tokens (P=5):    [t0, t1, t2, t3, t4]      (cached, 含 pending_root)
-tree draft tokens (N=6): [c1, c2, g1, g2, g3, g4]  (新建，pending_root不在这)
-                          ^   ^   ^   ^   ^   ^
-                         depth=1  depth=2
+prompt cache (P-1=4):   [t0, t1, t2, t3]           (cached, 不含 pending_root)
+tree tokens (N+1=7):    [root, c1, c2, g1, g2, g3, g4]  (pending_root + 6 drafts)
 
-Tree → full context mask (6 rows × 11 cols):
-              t0 t1 t2 t3 t4 | c1 c2 g1 g2 g3 g4
-         c1    1  1  1  1  1 |  1  0  0  0  0  0     c1 → prompt + 自己
-         c2    1  1  1  1  1 |  0  1  0  0  0  0     c2 → prompt + 自己 (兄弟不可见)
-         g1    1  1  1  1  1 |  1  0  1  0  0  0     g1 → prompt + c1 + 自己
-         g2    1  1  1  1  1 |  1  0  0  1  0  0     g2 → prompt + c1 + 自己
-         g3    1  1  1  1  1 |  0  1  0  0  1  0     g3 → prompt + c2 + 自己
-         g4    1  1  1  1  1 |  0  1  0  0  0  1     g4 → prompt + c2 + 自己
+Tree → full context mask (7 rows × 11 cols):
+              t0 t1 t2 t3 | r  c1 c2 g1 g2 g3 g4
+         r    1  1  1  1  | 1  0  0  0  0  0  0     root → prompt + 自己
+         c1   1  1  1  1  | 1  1  0  0  0  0  0     c1 → prompt + root + 自己
+         c2   1  1  1  1  | 1  0  1  0  0  0  0     c2 → prompt + root + 自己
+         g1   1  1  1  1  | 1  1  0  1  0  0  0     g1 → prompt + root + c1 + 自己
+         g2   1  1  1  1  | 1  1  0  0  1  0  0
+         g3   1  1  1  1  | 1  0  1  0  0  1  0
+         g4   1  1  1  1  | 1  0  1  0  0  0  1
 ```
 
-> pending_root (t4) 在 prompt cache 中，tree draft 节点通过 `full_mask[P:, 0:P] = True` 自然可以 attend 到它。
+> root = pending_root，作为 tree 的第一个 query token 参与验证。其 logits 直接用于排名验证的 root 步采样。prompt cache gather 排除 root 的旧 KV 位置，避免重复。
 
 ### 7.4 位置编码
 
@@ -421,37 +430,51 @@ while True:
 
 ### 8.4 Root Logits 获取
 
-排名验证的第一步需要大模型在 **root 节点**（pending_root）处的 target 分布来进行采样。
+排名验证的第一步需要大模型在 **root 节点**（pending_root）处的 target 分布来进行采样。Root 的 KV 已在 prompt cache 中，但它的 logits 需要在本轮树验证中显式计算。
 
-**终极解法：利用验证 logits 的 bonus row**
-
-当前线性验证流程中，`verify_row_indices` 包含 draft row + bonus row。bonus row 对应的正是：大模型在最后一个 draft token 位置产生的 logits（预测 bonus token）。这些 logits **同时也是**下一步的"root logits"：
+**解法：将 pending_root 作为 tree 验证输入的额外 query row**
 
 ```
-Step N 的验证:
-  输入:  [pending_root, draft_0, ..., draft_{K-1}]
-  logits: [验证 draft_0 的 logits, ..., 验证 draft_{K-1} 的 logits, bonus logits]
-                                                                  ^
-                                                    这些 logits = Step N+1 的 root logits
+tree 验证输入 = [pending_root_id, draft_depth1_nodes..., draft_depth2_nodes...]
+                 ^                                    ^
+               root query row                     draft 节点的 query rows
 ```
 
-只需将验证结束后的 **bonus/recovery row 的 logits** 保存到 `Eagle3RequestState`，下一步排名验证时直接取用。
+- pending_root 作为树的第一个 query token（depth=0），在 tree attention 中 attend 到 **prompt[0..P-2] + 自己**（root 不在 prompt cache 部分重复出现）
+- 大模型通过 tree attention 处理 pending_root，产出隐藏状态 → logits → **这就是 root 处的 target 分布**
+- 后续 draft 节点按 BFS 顺序排列，attend 到 prompt + 祖先
 
-**数据结构扩展**：
-```python
-@dataclass
-class Eagle3RequestState:
-    anchor_hidden_states: torch.Tensor   # 不变
-    draft_num_computed_tokens: int       # 不变
-    saved_logits: torch.Tensor | None    # 新增: 上一步的 bonus row logits (= 当前步的 root logits)
-    valid: bool = True
+**Attention mask 构造调整**：
+
+```
+prompt K/V: gather cache[0..P-2]  （排除 pending_root 的最后位置）
+tree K/V: [K_root, K_d0, K_d1, ...]  （含 root）
+
+Mask (root query row):
+  prompt[0..P-2]: True
+  tree position 0 (root): True
+  其他 tree positions: False
 ```
 
-**验收流程调整**：
-1. 第一步（prefill 后）：root logits 来自 prefill 阶段大模型的样本后 logits
-2. 后续步骤：`saved_logits` 就是当前步的 root logits，排名验证从这开始采样
+这样 root 不会在 prompt cache 和 tree KV 中重复出现，避免了 attention 中的重复 K 条目。
 
-**优点**：无需将 pending_root 纳入 tree 输入，避免 root 重复出现在 prompt cache 和 tree KV 中。
+### 8.5 为什么不能用 bonus row
+
+bonus row 表示的是 `p(next_token | 最后一个 draft token)`：
+
+```
+root → d1 → d2 → d3
+bonus row: p(x | d3)
+```
+
+但下一轮需要的是 `p(x | b)`，其中 b 是本轮的 bonus/recovery **采样结果**：
+
+```
+下一轮 root = b (从 p(x | d3) 采样得到的 token)
+下一轮需要: p(x | b)  ≠ p(x | d3)
+```
+
+发生 rejection 时同样：recovery token 是从父节点的 logits 采样出来的，这行 logits 的条件分布与 recovery token 的下一步分布不同。因此不能通过保存 bonus row logits 来充当下一步 root logits。
 
 ## 9. Model Runner 集成
 
