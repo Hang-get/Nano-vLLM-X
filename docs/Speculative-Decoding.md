@@ -1,9 +1,14 @@
 # Speculative Decoding
 
-Nano-vLLM-X supports N-gram prompt lookup and a linear EAGLE3 path. Both
-methods keep target-model sampling authoritative. EAGLE3 additionally uses
-draft probabilities and exact rejection sampling, so accepted drafts plus the
-recovery or bonus token follow the target distribution.
+Nano-vLLM-X supports N-gram prompt lookup and EAGLE3 decoding. Both methods
+keep target-model sampling authoritative. EAGLE3 has two modes:
+
+- **Linear mode** (`tree_top_k=1`, the default) uses draft probabilities and
+  rejection sampling. Accepted drafts plus the recovery or bonus token follow
+  the target distribution.
+- **Tree mode** (`tree_top_k>=2`) expands a top-k draft tree, verifies its
+  root and draft nodes in one target-model forward pass, and samples a path
+  only from target-model distributions.
 
 ## EAGLE3 Model Pair
 
@@ -49,18 +54,57 @@ EAGLE3 validates the exact checkpoint architecture, dimensions, vocabulary,
 dtype, and token IDs before allocating CUDA memory. Incompatible checkpoints
 fail with a field-specific error.
 
+## EAGLE3 Tree Mode
+
+Tree mode is enabled only when `tree_top_k >= 2`. The tree depth includes the
+pending root token, so a depth of `D` can accept at most `D - 1` draft tokens
+and emits one target-sampled token. `num_speculative_tokens` controls only the
+linear mode.
+
+```python
+llm = LLM(
+    target_model_path,
+    enforce_eager=True,
+    tensor_parallel_size=1,
+    speculative_config={
+        "method": "eagle3",
+        "draft_model": draft_model_path,
+        "tree_top_k": 2,
+        "tree_max_depth": 4,
+        "tree_prune_ratio": 0.0,
+    },
+)
+```
+
+- `tree_top_k` must be at least `1`. A value of `1` selects the linear path.
+- `tree_max_depth` must be at least `1` in tree mode.
+- `tree_prune_ratio` must be in `[0, 1]`. At `0`, each expanded node keeps up
+  to `tree_top_k` candidates. A positive value discards candidates whose
+  probability is below `tree_prune_ratio * best_candidate_probability`; `1`
+  keeps only the best candidate per expanded node.
+
+Tree mode reserves separate pools for persistent target-KV append blocks and
+transient draft copy-on-write blocks. Capacity pressure can reduce the
+effective tree depth for an individual request. Pruned draft blocks are
+released before target verification, and only the accepted target/draft path
+is committed.
+
 ## Current EAGLE3 Limits
 
 - One GPU and `tensor_parallel_size == 1`.
 - Eager execution only: `enforce_eager=True`.
-- Maximum context length of 2048 tokens.
+- The effective context length is the minimum of `max_model_len`, the target
+  checkpoint limit, and the draft checkpoint limit. The supported draft
+  checkpoint currently limits this pair to 2048 tokens.
 - Prefix caching is disabled.
-- Fixed-length linear proposals only.
-- No dynamic candidate tree, tree attention, tensor parallelism, or CUDA graph.
+- Tensor parallelism and CUDA Graph are unavailable in EAGLE3 mode.
+- Tree configuration is global to an `LLM` instance; a batch cannot mix linear
+  and tree EAGLE3 requests.
 
 The target and draft use the same logical block IDs but separate physical KV
 tensors. KV capacity is computed from the combined bytes per target and draft
-block.
+block. Tree mode additionally uses transient draft copy-on-write and target
+staging storage for its candidates.
 
 ## N-gram Usage
 

@@ -1,8 +1,21 @@
 # EAGLE3 TreeAttention 设计
 
+> **Implementation status (2026-08-13): Implemented.**
+>
+> Tree EAGLE3 is active when `tree_top_k>=2` and `tree_max_depth>=1`. The
+> implementation builds a BFS `TreeTopology`, reserves independent target and
+> draft-COW pools, releases pruned draft blocks before verification, verifies
+> root plus draft rows in one target forward, and commits only the accepted
+> path. `tree_top_k=1` remains the separate linear `RejectionSampler` path.
+>
+> Tree depth includes the pending root, available KV capacity can lower the
+> effective depth per request, and target draft rows are staged until rank
+> acceptance. Current source of truth: `nanovllm/v1/spec_decode/`,
+> `nanovllm/layers/attention.py`, and `nanovllm/engine/model_runner.py`.
+
 日期：2026-08-04
 
-状态：已确认，待实施计划
+状态：已实现；保留为 TreeAttention 的历史设计记录
 
 ## 1. 目标
 

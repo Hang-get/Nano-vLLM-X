@@ -1,5 +1,16 @@
 # EAGLE3 Inference Mode Design
 
+> **Implementation status (2026-08-13): Implemented.**
+>
+> `ModelRunner._warmup_eagle3_draft_step`, `run_eagle3_prefill`,
+> `run_eagle3_spec_decode`, `run_eagle3_tree_propose`, and
+> `run_eagle3_tree_verify` execute under `@torch.inference_mode()`. Tree
+> verification is split into propose/verify entry points, so the original
+> three-method scope does not describe every current EAGLE3 boundary.
+>
+> Current source of truth: `nanovllm/engine/model_runner.py` and
+> `tests/engine/test_eagle3_flow.py`.
+
 ## Goal
 
 Prevent EAGLE3 execution from retaining autograd graphs during inference. This

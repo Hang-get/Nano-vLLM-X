@@ -1,5 +1,14 @@
 # EAGLE3 Inference Mode Implementation Plan
 
+> **Completion status (2026-08-13): Completed.**
+>
+> The unchecked boxes below are retained for traceability. The documented
+> inference-mode boundaries are present in `nanovllm/engine/model_runner.py`.
+> The final runtime also has tree-specific `run_eagle3_tree_propose` and
+> `run_eagle3_tree_verify` boundaries, both decorated with
+> `@torch.inference_mode()`. Current test coverage is in
+> `tests/engine/test_eagle3_flow.py`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Run all EAGLE3 target and draft inference forwards without autograd graph retention.

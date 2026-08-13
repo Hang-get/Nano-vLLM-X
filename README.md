@@ -14,8 +14,11 @@ Nano-vLLM-X is a lightweight vLLM implementation built from scratch.
 
 ## Installation
 
-N-gram speculative decoding is available through `speculative_config`. It uses
-Numba for prompt lookup and Triton for GPU rejection sampling.
+N-gram and EAGLE3 speculative decoding are configured through
+`speculative_config`. N-gram uses Numba for prompt lookup and Triton for GPU
+rejection sampling. EAGLE3 supports linear and optional tree-shaped proposals;
+see [Speculative Decoding](docs/Speculative-Decoding.md) for the supported
+checkpoint pair and runtime constraints.
 
 ```bash
 pip install git+https://github.com/Hang-get/Nano-vLLM-X.git
@@ -49,6 +52,29 @@ sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
 prompts = ["Hello, Nano-vLLM-X."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
+```
+
+## EAGLE3 Tree Decoding
+
+EAGLE3 requires the compatible local target and draft checkpoints, one GPU,
+and eager execution. `tree_top_k=1` keeps the linear EAGLE3 path. Set
+`tree_top_k >= 2` and `tree_max_depth >= 1` to generate a pruned top-k token
+tree that the target model verifies in one forward pass per speculative round.
+
+```python
+llm = LLM(
+    "/models/Qwen3-4B-Instruct-2507",
+    enforce_eager=True,
+    tensor_parallel_size=1,
+    speculative_config={
+        "method": "eagle3",
+        "draft_model": "/models/Qwen3-4B-Instruct-2507-Eagle3",
+        "num_speculative_tokens": 5,  # Used by the linear path.
+        "tree_top_k": 2,
+        "tree_max_depth": 4,           # Includes the pending root token.
+        "tree_prune_ratio": 0.0,
+    },
+)
 ```
 
 ## Benchmark

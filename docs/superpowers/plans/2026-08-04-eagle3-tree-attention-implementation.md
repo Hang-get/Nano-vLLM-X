@@ -1,5 +1,15 @@
 # EAGLE3 TreeAttention Implementation Plan
 
+> **Completion status (2026-08-13): Completed.**
+>
+> The unchecked boxes below are retained as the historical implementation plan.
+> The delivered runtime has validated tree configuration, BFS tree proposals
+> with draft KV copy-on-write and capacity-aware depth, target tree attention
+> with root persistence and draft-KV staging, rank verification, accepted-path
+> commits, and a strict `tree_top_k=1` linear fallback. Tree mode is one-GPU,
+> eager-only, prefix-cache-disabled, and global per `LLM` instance. See
+> `docs/Speculative-Decoding.md` for the current operational contract.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` for inline, task-by-task implementation. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add TreeAttention speculative decoding for EAGLE3 when `tree_top_k >= 2`, while retaining the current bit-for-bit linear path for `tree_top_k == 1`.

@@ -1,5 +1,15 @@
 # Qwen3 EAGLE3 Linear Speculative Decoding Implementation Plan
 
+> **Completion status (2026-08-13): Historical plan completed; later tree work
+> extends its linear runtime.**
+>
+> The unchecked boxes below are retained as the original implementation record,
+> not as remaining work. The implemented linear contract is selected by
+> `speculative_config={"method": "eagle3", "tree_top_k": 1}`. The plan's
+> former no-tree non-goal is no longer current: tree mode is implemented by the
+> 2026-08-04 tree-attention work. EAGLE3 remains one-GPU, eager-only, and
+> prefix-cache-disabled. See `docs/Speculative-Decoding.md` for current usage.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在 nano-vLLM-MS2 中为 `Qwen/Qwen3-4B-Instruct-2507` target 和 `andyjjrt/Qwen3-4B-Instruct-2507-Eagle3` draft 实现单卡 eager、固定长度、线性 EAGLE3 speculative decoding。

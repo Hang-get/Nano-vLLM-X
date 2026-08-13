@@ -1,8 +1,24 @@
 # Qwen3 EAGLE3 线性推测解码设计
 
+> **Implementation status (2026-08-13): Superseded as a complete runtime description.**
+>
+> This document records the original linear EAGLE3 design. The linear path is
+> implemented, but current EAGLE3 also supports tree decoding. Treat the code
+> and `docs/Speculative-Decoding.md` as the operational contract.
+>
+> - `tree_top_k=1` selects this document's linear rejection-sampling path.
+> - `tree_top_k>=2` with `tree_max_depth>=1` selects tree proposal, target
+>   tree attention, rank verification, and accepted-path KV commits.
+> - `num_speculative_tokens` is used by linear EAGLE3 only; tree depth includes
+>   the pending root and can be reduced by available KV capacity.
+> - EAGLE3 remains single-GPU and eager-only, disables prefix caching, and is
+>   bound to the compatible Qwen3-4B checkpoint pair validated at startup.
+> - The effective context length is bounded by `max_model_len` and both
+>   checkpoint limits; the supported draft checkpoint limits this pair to 2048.
+
 日期：2026-07-26
 
-状态：已确认，进入实施计划
+状态：已实现；保留为线性 EAGLE3 的历史设计记录
 
 ## 1. 目标
 
