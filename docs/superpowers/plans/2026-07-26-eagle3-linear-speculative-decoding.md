@@ -8,7 +8,11 @@
 > `speculative_config={"method": "eagle3", "tree_top_k": 1}`. The plan's
 > former no-tree non-goal is no longer current: tree mode is implemented by the
 > 2026-08-04 tree-attention work. EAGLE3 remains one-GPU, eager-only, and
-> prefix-cache-disabled. See `docs/Speculative-Decoding.md` for current usage.
+> prefix-cache-disabled. The current supported pair is
+> `Qwen/Qwen3-14B` plus `thoughtworks/Qwen3-14B-Eagle3`; its 40960-token
+> target limit should initially be benchmarked at 4096 tokens on A800 80G.
+> The historical 4B details below are retained for traceability. See
+> `docs/Speculative-Decoding.md` for current usage.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 

@@ -34,7 +34,7 @@ def eagle_llm():
         target_path,
         enforce_eager=True,
         tensor_parallel_size=1,
-        max_model_len=2048,
+        max_model_len=4096,
         speculative_config={
             "method": "eagle3",
             "draft_model": draft_path,

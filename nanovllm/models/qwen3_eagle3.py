@@ -97,7 +97,7 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
         self.model = Qwen3Eagle3Model(config, target_embedding)
         self.lm_head = ParallelLMHead(config.draft_vocab_size, config.hidden_size)
         self.draft_id_to_target_id = nn.Parameter(
-            torch.zeros(config.draft_vocab_size, dtype=torch.long),
+            torch.zeros(config.draft_vocab_size, dtype=torch.int32),
             requires_grad=False,
         )
         target_weight = target_embedding.weight
@@ -134,9 +134,9 @@ class Qwen3Eagle3ForCausalLM(nn.Module):
         draft_ids = torch.arange(
             self.config.draft_vocab_size,
             device=draft_logits.device,
-            dtype=torch.long,
+            dtype=torch.int32,
         )
-        target_ids = draft_ids + self.draft_id_to_target_id
+        target_ids = (draft_ids + self.draft_id_to_target_id).to(torch.long)
         logits = draft_logits.new_full(
             (draft_logits.size(0), self.config.vocab_size),
             float("-inf"),

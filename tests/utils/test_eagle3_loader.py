@@ -26,6 +26,7 @@ def make_model():
         rope_scaling=None,
         vocab_size=13,
         draft_vocab_size=4,
+        architectures=["LlamaForCausalLM"],
     )
     target_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
     return Qwen3Eagle3ForCausalLM(config, target_embedding), target_embedding
@@ -89,6 +90,22 @@ def test_strict_loader_maps_packed_weights_and_injects_embedding(
         loaded.model.layers[0].mlp.gate_up_proj.weight,
         source.model.layers[0].mlp.gate_up_proj.weight,
     )
+
+
+def test_loader_accepts_int32_d2t_for_thoughtworks_checkpoint(
+    tmp_path, single_rank_dist
+):
+    source, _ = make_model()
+    checkpoint = checkpoint_tensors(source)
+    checkpoint["d2t"] = torch.tensor([0, 2, 4, 6], dtype=torch.int32)
+    draft_dir = tmp_path / "draft"
+    write_checkpoint(draft_dir, checkpoint)
+    loaded, target_embedding = make_model()
+
+    load_eagle3_weights(loaded, str(draft_dir), target_embedding)
+
+    assert loaded.draft_id_to_target_id.dtype == torch.int32
+    assert loaded.draft_id_to_target_id.tolist() == [0, 2, 4, 6]
 
 
 @pytest.mark.parametrize("mutation", ["missing_d2t", "unknown", "wrong_shape"])

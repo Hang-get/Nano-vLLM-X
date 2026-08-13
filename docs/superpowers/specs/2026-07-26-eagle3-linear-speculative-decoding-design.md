@@ -11,10 +11,12 @@
 >   tree attention, rank verification, and accepted-path KV commits.
 > - `num_speculative_tokens` is used by linear EAGLE3 only; tree depth includes
 >   the pending root and can be reduced by available KV capacity.
-> - EAGLE3 remains single-GPU and eager-only, disables prefix caching, and is
->   bound to the compatible Qwen3-4B checkpoint pair validated at startup.
-> - The effective context length is bounded by `max_model_len` and both
->   checkpoint limits; the supported draft checkpoint limits this pair to 2048.
+> - EAGLE3 remains single-GPU and eager-only, disables prefix caching, and now
+>   validates the Qwen3-14B Thoughtworks pair at startup. The supported pair is
+>   `Qwen/Qwen3-14B` plus `thoughtworks/Qwen3-14B-Eagle3`.
+> - The current target context limit is 40960 tokens; 4096 is the initial A800
+>   80G benchmark setting. The historical 4B model details below are retained
+>   as the original design record, not as the current runtime contract.
 
 日期：2026-07-26
 

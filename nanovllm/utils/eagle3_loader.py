@@ -101,9 +101,9 @@ def _validate_d2t(model) -> None:
     draft_ids = torch.arange(
         model.config.draft_vocab_size,
         device=offsets.device,
-        dtype=torch.long,
+        dtype=offsets.dtype,
     )
-    target_ids = draft_ids + offsets
+    target_ids = (draft_ids + offsets).to(torch.long)
     if bool(((target_ids < 0) | (target_ids >= model.config.vocab_size)).any()):
         raise ValueError("d2t target IDs must be within target vocabulary")
     if target_ids.unique().numel() != target_ids.numel():

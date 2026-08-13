@@ -63,12 +63,12 @@ tree that the target model verifies in one forward pass per speculative round.
 
 ```python
 llm = LLM(
-    "/models/Qwen3-4B-Instruct-2507",
+    "/models/Qwen3-14B",
     enforce_eager=True,
     tensor_parallel_size=1,
     speculative_config={
         "method": "eagle3",
-        "draft_model": "/models/Qwen3-4B-Instruct-2507-Eagle3",
+        "draft_model": "/models/Qwen3-14B-Eagle3",
         "num_speculative_tokens": 5,  # Used by the linear path.
         "tree_top_k": 2,
         "tree_max_depth": 4,           # Includes the pending root token.
@@ -89,8 +89,11 @@ Use `bench_eagle3.py` to compare target-only decoding with EAGLE3:
 
 ```powershell
 py -3.12 bench_eagle3.py `
-  --target-model D:\models\Qwen3-4B-Instruct-2507 `
-  --draft-model D:\models\Qwen3-4B-Instruct-2507-Eagle3
+  --target-model D:\models\Qwen3-14B `
+  --draft-model D:\models\Qwen3-14B-Eagle3 `
+  --max-model-len 4096 `
+  --temperature 0.6 `
+  --gpu-memory-utilization 0.80
 ```
 
 Both scripts emit JSON with end-to-end throughput, throughput speedup, TTFT,

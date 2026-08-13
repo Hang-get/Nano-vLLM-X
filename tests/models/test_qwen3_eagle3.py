@@ -24,6 +24,7 @@ def make_config():
         rope_scaling=None,
         vocab_size=13,
         draft_vocab_size=4,
+        architectures=["LlamaForCausalLM"],
     )
 
 
@@ -80,3 +81,17 @@ def test_target_embedding_shape_is_validated_before_model_construction(
 
     with pytest.raises(ValueError, match="target embedding shape expected"):
         Qwen3Eagle3ForCausalLM(config, wrong_embedding)
+
+
+def test_thoughtworks_checkpoint_uses_int32_d2t_mapping(single_rank_dist):
+    config = make_config()
+    model = Qwen3Eagle3ForCausalLM(
+        config,
+        VocabParallelEmbedding(config.vocab_size, config.hidden_size),
+    )
+
+    assert model.draft_id_to_target_id.dtype == torch.int32
+    model.draft_id_to_target_id.copy_(torch.tensor([0, 2, 4, 6], dtype=torch.int32))
+    logits = model.compute_logits(torch.zeros((1, config.hidden_size)))
+
+    assert logits.shape == (1, config.vocab_size)

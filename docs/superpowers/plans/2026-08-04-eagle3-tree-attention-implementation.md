@@ -9,6 +9,8 @@
 > commits, and a strict `tree_top_k=1` linear fallback. Tree mode is one-GPU,
 > eager-only, prefix-cache-disabled, and global per `LLM` instance. See
 > `docs/Speculative-Decoding.md` for the current operational contract.
+> The runtime's current supported checkpoint pair targets Qwen3-14B; legacy
+> Qwen3-4B references below remain only as implementation history.
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use `superpowers:executing-plans` for inline, task-by-task implementation. Steps use checkbox (`- [ ]`) syntax for tracking.
 

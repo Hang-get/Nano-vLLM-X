@@ -12,12 +12,19 @@ keep target-model sampling authoritative. EAGLE3 has two modes:
 
 ## EAGLE3 Model Pair
 
-The first supported pair is fixed deliberately:
+The supported Qwen3-14B checkpoint pair is:
 
-- Target: `Qwen/Qwen3-4B-Instruct-2507`
-- Draft: `andyjjrt/Qwen3-4B-Instruct-2507-Eagle3`
-- Draft revision: `408d111ec6cde42f2784f50cd14189d626a6eae4`
-- Target auxiliary layers: `(2, 18, 33)`
+- Target: `Qwen/Qwen3-14B`, revision
+  `40c069824f4251a91eefaf281ebe4c544efd3e18`
+- Draft: `thoughtworks/Qwen3-14B-Eagle3`, revision
+  `af02e393da5821ad04d17333622678c57a56f860`
+- Target auxiliary layers: `(2, 20, 37)`
+
+The Thoughtworks draft stores `d2t` as `int32`, has architecture
+`LlamaForCausalLM`, and intentionally omits several base-model config fields.
+The runtime inherits the target's 40960-token context limit and validates the
+fields that are part of this checkpoint contract. Neither model uses YaRN, so
+do not enable YaRN for this pair.
 
 Download both checkpoints to local directories. Runtime loading does not fetch
 weights or a draft tokenizer. The target tokenizer is used for both models.
@@ -27,14 +34,15 @@ weights or a draft tokenizer. The target tokenizer is used for both models.
 ```python
 from nanovllm import LLM, SamplingParams
 
-target_model_path = "/models/Qwen3-4B-Instruct-2507"
-draft_model_path = "/models/Qwen3-4B-Instruct-2507-Eagle3"
+target_model_path = "/models/Qwen3-14B"
+draft_model_path = "/models/Qwen3-14B-Eagle3"
 
 llm = LLM(
     target_model_path,
     enforce_eager=True,
     tensor_parallel_size=1,
-    max_model_len=2048,
+    max_model_len=4096,
+    gpu_memory_utilization=0.80,
     speculative_config={
         "method": "eagle3",
         "draft_model": draft_model_path,
@@ -50,9 +58,10 @@ print(outputs[0]["text"])
 print(llm.spec_decode_metrics)
 ```
 
-EAGLE3 validates the exact checkpoint architecture, dimensions, vocabulary,
-dtype, and token IDs before allocating CUDA memory. Incompatible checkpoints
-fail with a field-specific error.
+EAGLE3 validates the checkpoint architecture, dimensions, vocabulary, dtype,
+and applicable token IDs before allocating CUDA memory. Incompatible checkpoints
+fail with a field-specific error. It does not verify a Hugging Face revision
+from a local directory; download the listed revisions explicitly.
 
 ## EAGLE3 Tree Mode
 
@@ -93,9 +102,9 @@ is committed.
 
 - One GPU and `tensor_parallel_size == 1`.
 - Eager execution only: `enforce_eager=True`.
-- The effective context length is the minimum of `max_model_len`, the target
-  checkpoint limit, and the draft checkpoint limit. The supported draft
-  checkpoint currently limits this pair to 2048 tokens.
+- The effective context length is the minimum of `max_model_len` and the target
+  checkpoint limit. The supported Qwen3-14B target is limited to 40960 tokens;
+  use 4096 as the initial A800 80G benchmark setting.
 - Prefix caching is disabled.
 - Tensor parallelism and CUDA Graph are unavailable in EAGLE3 mode.
 - Tree configuration is global to an `LLM` instance; a batch cannot mix linear
@@ -148,9 +157,9 @@ py -3.12 -m pytest tests -q -m "not cuda and not model_weights"
 CUDA and local-checkpoint checks:
 
 ```powershell
-$env:NANOVLLM_TARGET_MODEL='D:\models\Qwen3-4B-Instruct-2507'
-$env:NANOVLLM_EAGLE3_MODEL='D:\models\Qwen3-4B-Instruct-2507-Eagle3'
-py -3.12 -m pytest tests/integration/test_eagle3_qwen3_4b.py -q -m "cuda and model_weights"
+$env:NANOVLLM_TARGET_MODEL='D:\models\Qwen3-14B'
+$env:NANOVLLM_EAGLE3_MODEL='D:\models\Qwen3-14B-Eagle3'
+py -3.12 -m pytest tests/integration/test_eagle3_qwen3_14b.py -q -m "cuda and model_weights"
 ```
 
 Benchmark target-only and EAGLE3 with identical prompts and sampling settings:
@@ -158,7 +167,10 @@ Benchmark target-only and EAGLE3 with identical prompts and sampling settings:
 ```powershell
 py -3.12 bench_eagle3.py `
   --target-model $env:NANOVLLM_TARGET_MODEL `
-  --draft-model $env:NANOVLLM_EAGLE3_MODEL
+  --draft-model $env:NANOVLLM_EAGLE3_MODEL `
+  --max-model-len 4096 `
+  --temperature 0.6 `
+  --gpu-memory-utilization 0.80
 ```
 
 Benchmark target-only and N-gram decoding with repeated token prompts that make

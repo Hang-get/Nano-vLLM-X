@@ -7,6 +7,8 @@
 > draft-COW pools, releases pruned draft blocks before verification, verifies
 > root plus draft rows in one target forward, and commits only the accepted
 > path. `tree_top_k=1` remains the separate linear `RejectionSampler` path.
+> The current checkpoint contract is the Qwen3-14B Thoughtworks pair documented in
+> `docs/Speculative-Decoding.md`; any Qwen3-4B references below are historical.
 >
 > Tree depth includes the pending root, available KV capacity can lower the
 > effective depth per request, and target draft rows are staged until rank

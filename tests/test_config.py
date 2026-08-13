@@ -13,40 +13,14 @@ DRAFT_PATH = "draft-checkpoint"
 def make_target_config(**overrides):
     values = {
         "architectures": ["Qwen3ForCausalLM"],
-        "hidden_size": 2560,
-        "intermediate_size": 9728,
-        "num_hidden_layers": 36,
-        "num_attention_heads": 32,
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 40,
         "num_key_value_heads": 8,
         "head_dim": 128,
         "vocab_size": 151936,
-        "max_position_embeddings": 262144,
-        "bos_token_id": 151643,
-        "eos_token_id": 151645,
-        "attention_bias": False,
-        "hidden_act": "silu",
-        "rms_norm_eps": 1e-6,
-        "rope_theta": 5000000,
-        "tie_word_embeddings": True,
-        "dtype": "bfloat16",
-        "rope_scaling": {"type": "dynamic"},
-    }
-    values.update(overrides)
-    return SimpleNamespace(**values)
-
-
-def make_draft_config(**overrides):
-    values = {
-        "architectures": ["LlamaForCausalLMEagle3"],
-        "hidden_size": 2560,
-        "intermediate_size": 12288,
-        "num_hidden_layers": 1,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128,
-        "vocab_size": 151936,
-        "draft_vocab_size": 32000,
-        "max_position_embeddings": 2048,
+        "max_position_embeddings": 40960,
         "bos_token_id": 151643,
         "eos_token_id": 151645,
         "attention_bias": False,
@@ -55,6 +29,27 @@ def make_draft_config(**overrides):
         "rope_theta": 1000000,
         "tie_word_embeddings": False,
         "dtype": "bfloat16",
+        "rope_scaling": None,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def make_draft_config(**overrides):
+    values = {
+        "architectures": ["LlamaForCausalLM"],
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 40,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "draft_vocab_size": 32000,
+        "rope_theta": 1000000,
+        "rms_norm_eps": 1e-6,
+        "torch_dtype": "bfloat16",
+        "tie_word_embeddings": False,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -107,9 +102,11 @@ def eagle3_options(draft_dir, **overrides):
     return options
 
 
-def test_eagle3_config_resolves_contract(tmp_path, monkeypatch, single_rank_dist):
+def test_eagle3_config_accepts_thoughtworks_qwen3_14b(
+    tmp_path, monkeypatch, single_rank_dist
+):
     target_dir, draft_dir = create_checkpoint_dirs(tmp_path)
-    target_config = make_target_config(num_hidden_layers=36)
+    target_config = make_target_config()
     draft_config = make_draft_config()
     install_config_loader(
         monkeypatch, target_dir, draft_dir, target_config, draft_config
@@ -121,9 +118,9 @@ def test_eagle3_config_resolves_contract(tmp_path, monkeypatch, single_rank_dist
         speculative_config=eagle3_options(draft_dir),
     )
 
-    assert config.max_model_len == 2048
+    assert config.max_model_len == 4096
     assert config.enable_prefix_cache is False
-    assert config.speculative_config.auxiliary_layer_ids == (2, 18, 33)
+    assert config.speculative_config.auxiliary_layer_ids == (2, 20, 37)
     assert config.speculative_config.draft_hf_config is draft_config
     assert config.speculative_config.draft_model == str(draft_dir)
     assert config.hf_config.rope_scaling is None
@@ -132,16 +129,16 @@ def test_eagle3_config_resolves_contract(tmp_path, monkeypatch, single_rank_dist
 @pytest.mark.parametrize(
     ("role", "field", "actual", "expected"),
     [
-        ("target", "hidden_size", 1, 2560),
-        ("target", "intermediate_size", 1, 9728),
-        ("target", "num_attention_heads", 1, 32),
+        ("target", "hidden_size", 1, 5120),
+        ("target", "intermediate_size", 1, 17408),
+        ("target", "num_attention_heads", 1, 40),
         ("target", "num_key_value_heads", 1, 8),
         ("target", "head_dim", 1, 128),
         ("target", "vocab_size", 1, 151936),
         ("target", "dtype", "float16", "bfloat16"),
-        ("draft", "hidden_size", 1, 2560),
-        ("draft", "intermediate_size", 1, 12288),
-        ("draft", "num_attention_heads", 1, 32),
+        ("draft", "hidden_size", 1, 5120),
+        ("draft", "intermediate_size", 1, 17408),
+        ("draft", "num_attention_heads", 1, 40),
         ("draft", "num_key_value_heads", 1, 8),
         ("draft", "head_dim", 1, 128),
         ("draft", "vocab_size", 1, 151936),
@@ -179,25 +176,17 @@ def test_eagle3_contract_rejects_incompatible_dimensions_and_dtype(
             "draft",
             "architecture",
             "Qwen3ForCausalLM",
-            "LlamaForCausalLMEagle3",
+            "LlamaForCausalLM",
             make_target_config(),
             make_draft_config(architectures=["Qwen3ForCausalLM"]),
         ),
         (
             "target",
             "num_hidden_layers",
-            35,
-            36,
-            make_target_config(num_hidden_layers=35),
+            39,
+            40,
+            make_target_config(num_hidden_layers=39),
             make_draft_config(),
-        ),
-        (
-            "draft",
-            "max_position_embeddings",
-            4096,
-            2048,
-            make_target_config(),
-            make_draft_config(max_position_embeddings=4096),
         ),
     ],
 )

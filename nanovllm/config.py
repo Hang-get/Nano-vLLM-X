@@ -125,13 +125,18 @@ class Config:
             target_path=self.model,
             draft_path=draft_model,
         )
+        draft_hf_config.max_position_embeddings = self.hf_config.max_position_embeddings
         draft_hf_config.rope_scaling = None
         self.hf_config.rope_scaling = None          # disable auto rope scaling
         speculative_config.draft_hf_config = draft_hf_config
         self.enable_prefix_cache = False
         self.max_model_len = min(
             self.max_model_len,
-            draft_hf_config.max_position_embeddings,
+            getattr(
+                draft_hf_config,
+                "max_position_embeddings",
+                self.hf_config.max_position_embeddings,
+            ),
         )
 
     @staticmethod
