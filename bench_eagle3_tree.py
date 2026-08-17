@@ -100,8 +100,7 @@ def environment_record() -> dict:
     device = torch.cuda.get_device_properties(0)
     prompt_text = "\n".join(PROMPTS).encode("utf-8")
     return {
-        "git_revision": git_revision(),
-        "nanovllm_version": package_version("nano-vllm-x"),
+        "nanovllm_source_revision": git_revision(),
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,
@@ -125,8 +124,20 @@ def environment_record() -> dict:
     }
 
 
-def latest_output_token_counts(runs: dict[str, list[dict]]) -> dict[str, int]:
-    return {mode: values[-1]["output_tokens"] for mode, values in runs.items()}
+def validate_repeat_output_token_counts(
+    runs: dict[str, list[dict]], repeat: int
+) -> dict[str, int]:
+    if any(len(values) <= repeat for values in runs.values()):
+        raise ValueError(f"missing benchmark result for repeat {repeat}")
+    output_counts = {
+        mode: values[repeat]["output_tokens"] for mode, values in runs.items()
+    }
+    if len(set(output_counts.values())) != 1:
+        raise ValueError(
+            f"benchmark modes generated different output token counts in repeat "
+            f"{repeat}; results are not comparable"
+        )
+    return output_counts
 
 
 def main():
@@ -163,6 +174,7 @@ def main():
     )
     runs = {mode: [] for mode, _ in modes}
     execution_order = []
+    output_tokens_by_repeat = []
     for repeat in range(args.repeats):
         ordered_modes = modes[repeat % len(modes) :] + modes[: repeat % len(modes)]
         execution_order.append([mode for mode, _ in ordered_modes])
@@ -180,12 +192,9 @@ def main():
             result["repeat"] = repeat
             runs[mode].append(result)
 
-        output_counts = latest_output_token_counts(runs)
-        if len(set(output_counts.values())) != 1:
-            raise RuntimeError(
-                "benchmark modes generated different output token counts; "
-                "results are not comparable"
-            )
+        output_tokens_by_repeat.append(
+            validate_repeat_output_token_counts(runs, repeat)
+        )
 
     summaries = {mode: summarize_benchmark_runs(values) for mode, values in runs.items()}
     baseline = summaries["target_only"]
@@ -203,6 +212,7 @@ def main():
             ),
             "request_warmup": args.warmup_tokens > 0,
             "mode_order_by_repeat": execution_order,
+            "output_tokens_by_repeat": output_tokens_by_repeat,
         },
         "linear_eagle3_mean_throughput_speedup": speedup(
             baseline, linear_eagle3
