@@ -173,6 +173,7 @@ def run_mode(
 
 
 def speedup(baseline: dict, speculative: dict) -> float:
+    """Return a throughput ratio for either one run or an aggregated summary."""
     baseline_throughput = baseline["throughput_tokens_per_second"]
     if baseline_throughput == 0:
         return 0.0

@@ -101,6 +101,7 @@ def environment_record() -> dict:
     prompt_text = "\n".join(PROMPTS).encode("utf-8")
     return {
         "git_revision": git_revision(),
+        "nanovllm_version": package_version("nano-vllm-x"),
         "python": sys.version,
         "platform": platform.platform(),
         "torch": torch.__version__,
@@ -112,11 +113,20 @@ def environment_record() -> dict:
         "gpu_memory_bytes": device.total_memory,
         "packages": {
             name: package_version(name)
-            for name in ("transformers", "flash-attn", "triton", "safetensors")
+            for name in (
+                "transformers",
+                "flash-attn",
+                "triton",
+                "safetensors",
+            )
         },
         "prompt_count": len(PROMPTS),
         "prompt_sha256": hashlib.sha256(prompt_text).hexdigest(),
     }
+
+
+def latest_output_token_counts(runs: dict[str, list[dict]]) -> dict[str, int]:
+    return {mode: values[-1]["output_tokens"] for mode, values in runs.items()}
 
 
 def main():
@@ -170,8 +180,8 @@ def main():
             result["repeat"] = repeat
             runs[mode].append(result)
 
-        output_counts = {mode: run["output_tokens"] for mode, run in runs.items()}
-        if len({values[-1] for values in output_counts.values()}) != 1:
+        output_counts = latest_output_token_counts(runs)
+        if len(set(output_counts.values())) != 1:
             raise RuntimeError(
                 "benchmark modes generated different output token counts; "
                 "results are not comparable"
@@ -186,11 +196,18 @@ def main():
         "configuration": vars(args),
         "measurement": {
             "ignore_eos": True,
+            "output_length_policy": "force_max_tokens",
+            "acceptance_rate_scope": (
+                "Measured with ignore_eos=True, so EOS does not end requests; "
+                "acceptance rates can differ from an EOS-respecting workload."
+            ),
             "request_warmup": args.warmup_tokens > 0,
             "mode_order_by_repeat": execution_order,
         },
-        "linear_eagle3_speedup": speedup(baseline, linear_eagle3),
-        "tree_eagle3_speedup": speedup(baseline, tree_eagle3),
+        "linear_eagle3_mean_throughput_speedup": speedup(
+            baseline, linear_eagle3
+        ),
+        "tree_eagle3_mean_throughput_speedup": speedup(baseline, tree_eagle3),
         "summaries": [baseline, linear_eagle3, tree_eagle3],
         "results": [run for mode, _ in modes for run in runs[mode]],
     }
