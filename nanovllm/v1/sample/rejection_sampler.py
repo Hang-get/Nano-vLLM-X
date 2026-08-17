@@ -246,13 +246,14 @@ class RejectionSampler(nn.Module):
                     "acceptance_uniforms values must be finite and in [0, 1]"
                 )
 
+        safe_temperatures = temperatures.to(torch.float32).clamp_min(1e-6)
         bonus_logits = logits[total_num_draft_tokens:]
         if recovery_noise is None:
             bonus_token_ids = self.sampler(bonus_logits, temperatures).to(torch.int64)
         else:
             bonus_probs = torch.softmax(
                 bonus_logits.to(torch.float32)
-                / temperatures.to(torch.float32).unsqueeze(-1),
+                / safe_temperatures.unsqueeze(-1),
                 dim=-1,
             )
             bonus_token_ids = bonus_probs.div(recovery_noise).argmax(dim=-1)
@@ -267,7 +268,7 @@ class RejectionSampler(nn.Module):
 
         target_logits = logits[:total_num_draft_tokens].to(torch.float32)
         token_temperatures = _expand_batch_to_tokens(
-            temperatures.to(torch.float32),
+            safe_temperatures,
             num_draft_tokens,
             total_num_draft_tokens,
             target_logits.device,
@@ -562,8 +563,9 @@ def reference_rejection_sample(
             "recovery_uniforms values must be finite and positive"
         )
 
+    safe_temperatures = temperatures.to(torch.float32).clamp_min(1e-6)
     token_temperatures = _expand_batch_to_tokens(
-        temperatures.to(torch.float32),
+        safe_temperatures,
         lengths,
         total_drafts,
         target_logits.device,
@@ -578,7 +580,7 @@ def reference_rejection_sample(
         target_probs = target_logits.new_empty((0, vocab_size), dtype=torch.float32)
     bonus_probs = torch.softmax(
         target_logits[total_drafts:].to(torch.float32)
-        / temperatures.to(torch.float32).unsqueeze(-1),
+        / safe_temperatures.unsqueeze(-1),
         dim=-1,
     )
 

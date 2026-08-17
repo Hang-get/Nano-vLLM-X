@@ -289,14 +289,17 @@ class Eagle3Proposer:
                 continue
             sampling_requests = [active[row] for row in sampling_rows]
             active_temperatures = temperatures[sampling_requests].to(torch.float32)
+            greedy = active_temperatures <= 0
+            safe_temperatures = active_temperatures.clamp_min(1e-6)
             probabilities = torch.softmax(
                 logits[sampling_rows].to(torch.float32)
-                / active_temperatures.unsqueeze(-1),
+                / safe_temperatures.unsqueeze(-1),
                 dim=-1,
             )
             sampled = probabilities.div(
                 torch.empty_like(probabilities).exponential_().clamp_min_(1e-10)
             ).argmax(dim=-1)
+            sampled = torch.where(greedy, logits[sampling_rows].argmax(dim=-1), sampled)
             for row, request_idx in enumerate(sampling_requests):
                 token_id = int(sampled[row].item())
                 request_tokens[request_idx].append(token_id)
@@ -371,7 +374,7 @@ class Eagle3Proposer:
                 continue
             probabilities = torch.softmax(
                 root_logits[root_row].to(torch.float32)
-                / temperatures[root.request_idx].to(torch.float32),
+                / temperatures[root.request_idx].to(torch.float32).clamp_min(1e-6),
                 dim=-1,
             )
             token_ids = self._select_tree_children(probabilities)
@@ -420,7 +423,7 @@ class Eagle3Proposer:
                     continue
                 probabilities = torch.softmax(
                     logits[row].to(torch.float32)
-                    / temperatures[node.request_idx].to(torch.float32),
+                    / temperatures[node.request_idx].to(torch.float32).clamp_min(1e-6),
                     dim=-1,
                 )
                 token_ids = self._select_tree_children(probabilities)

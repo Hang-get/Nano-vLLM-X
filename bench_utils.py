@@ -1,6 +1,6 @@
 import atexit
 from dataclasses import asdict
-from statistics import median
+from statistics import mean, median, stdev
 from time import perf_counter
 
 import torch
@@ -28,6 +28,42 @@ def summarize(values: list[float]) -> dict[str, float]:
     }
 
 
+def summarize_benchmark_runs(results: list[dict]) -> dict:
+    if not results:
+        return {}
+
+    numeric_fields = (
+        "requests",
+        "output_tokens",
+        "elapsed_seconds",
+        "throughput_tokens_per_second",
+        "acceptance_rate",
+        "speculative_time_ms",
+        "speculative_time_fraction",
+        "draft_tokens_proposed",
+        "draft_tokens_accepted",
+        "mean_effective_draft_length",
+        "fallback_decode_count",
+        "draft_time_ms",
+        "verify_time_ms",
+        "sampling_time_ms",
+    )
+    summary = {
+        "mode": results[0]["mode"],
+        "repeats": len(results),
+    }
+    for field in numeric_fields:
+        values = [result[field] for result in results]
+        summary[field] = mean(values)
+        summary[f"{field}_stddev"] = stdev(values) if len(values) > 1 else 0.0
+    for field in ("ttft", "completion_latency", "tpot"):
+        summary[field] = {
+            key: mean(result[field][key] for result in results)
+            for key in ("mean_ms", "p50_ms", "p95_ms")
+        }
+    return summary
+
+
 def run_mode(
     *,
     mode: str,
@@ -36,11 +72,24 @@ def run_mode(
     sampling: SamplingParams,
     seed: int,
     llm_kwargs: dict,
+    warmup_prompt: str | list[int] | None = None,
+    warmup_tokens: int = 8,
 ) -> dict:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     llm = LLM(model, **llm_kwargs)
     try:
+        if warmup_prompt is not None and warmup_tokens > 0:
+            llm.generate(
+                [warmup_prompt],
+                SamplingParams(
+                    temperature=sampling.temperature,
+                    max_tokens=min(warmup_tokens, sampling.max_tokens),
+                    ignore_eos=True,
+                ),
+                use_tqdm=False,
+            )
+            torch.cuda.synchronize()
         llm.reset_spec_decode_metrics()
         request_ids = []
         for prompt in prompts:
@@ -92,6 +141,12 @@ def run_mode(
         )
         return {
             "mode": mode,
+            "warmup": {
+                "model_runner": True,
+                "request_tokens": min(warmup_tokens, sampling.max_tokens)
+                if warmup_prompt is not None
+                else 0,
+            },
             "requests": len(request_ids),
             "output_tokens": output_tokens,
             "elapsed_seconds": elapsed_seconds,
