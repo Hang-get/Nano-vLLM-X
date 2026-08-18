@@ -173,6 +173,26 @@ py -3.12 bench_eagle3.py `
   --gpu-memory-utilization 0.80
 ```
 
+Before trusting tree performance numbers, compare the complete generated token
+sequences against target-only decoding under greedy sampling. The checker uses
+the same prompts, seed, and sampling settings for both runs and exits with a
+non-zero status at the first mismatch:
+
+```powershell
+py -3.12 check_eagle3_tree_correctness.py `
+  --target-model $env:NANOVLLM_TARGET_MODEL `
+  --draft-model $env:NANOVLLM_EAGLE3_MODEL `
+  --max-model-len 4096 `
+  --max-tokens 32 `
+  --tree-top-k 2 `
+  --tree-max-depth 3 `
+  --gpu-memory-utilization 0.80
+```
+
+The default `ignore_eos=True` forces a fixed output length. Use
+`--no-ignore-eos` for an additional natural-EOS check. Only proceed to the
+tree benchmark after the checker prints `CORRECTNESS: PASS`.
+
 Benchmark target-only and N-gram decoding with repeated token prompts that make
 prompt lookup measurable:
 
