@@ -1,10 +1,11 @@
 import argparse
 import atexit
 import gc
+import json
 
 import torch
 
-from eagle3_correctness import compare_token_sequences
+from eagle3_correctness import build_correctness_report, compare_token_sequences
 from nanovllm import LLM, SamplingParams
 
 
@@ -36,6 +37,10 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.80)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--repeats", type=int, default=2)
+    parser.add_argument(
+        "--dump-json",
+        help="Write the first failed repeat, including complete token IDs, to JSON.",
+    )
     parser.add_argument(
         "--ignore-eos",
         action=argparse.BooleanOptionalAction,
@@ -107,6 +112,20 @@ def main():
         tree_outputs = run_generation(args, tree=True, seed=seed)
         mismatches = compare_token_sequences(target_outputs, tree_outputs)
         if mismatches:
+            if args.dump_json:
+                report = build_correctness_report(
+                    configuration={
+                        **vars(args),
+                        "repeat": repeat,
+                        "prompt_count": len(PROMPTS),
+                    },
+                    target_outputs=target_outputs,
+                    tree_outputs=tree_outputs,
+                    mismatches=mismatches,
+                )
+                with open(args.dump_json, "w", encoding="utf-8") as report_file:
+                    json.dump(report, report_file, indent=2, sort_keys=True)
+                print(f"Wrote correctness report: {args.dump_json}")
             print(f"[FAIL] repeat={repeat}, mismatches={len(mismatches)}")
             for mismatch in mismatches:
                 print(

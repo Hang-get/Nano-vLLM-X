@@ -1,4 +1,4 @@
-from typing import Dict, List, Sequence, Union
+from typing import Any, Dict, List, Sequence, Union
 
 
 def compare_token_sequences(
@@ -39,3 +39,20 @@ def compare_token_sequences(
             }
         )
     return mismatches
+
+
+def build_correctness_report(
+    *,
+    configuration: Dict[str, Any],
+    target_outputs: Sequence[Sequence[int]],
+    tree_outputs: Sequence[Sequence[int]],
+    mismatches: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Build a JSON-serializable report for a correctness run."""
+    return {
+        "configuration": dict(configuration),
+        "target_outputs": [list(output) for output in target_outputs],
+        "tree_outputs": [list(output) for output in tree_outputs],
+        "mismatches": [dict(mismatch) for mismatch in mismatches],
+        "passed": not mismatches,
+    }

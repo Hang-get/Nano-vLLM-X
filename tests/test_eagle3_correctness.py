@@ -1,6 +1,6 @@
 import pytest
 
-from eagle3_correctness import compare_token_sequences
+from eagle3_correctness import build_correctness_report, compare_token_sequences
 
 
 def test_compare_token_sequences_accepts_identical_outputs():
@@ -30,3 +30,20 @@ def test_compare_token_sequences_reports_first_token_mismatch():
 def test_compare_token_sequences_rejects_different_request_counts():
     with pytest.raises(ValueError, match="request count"):
         compare_token_sequences([[1]], [[1], [2]])
+
+
+def test_build_correctness_report_is_json_serializable():
+    report = build_correctness_report(
+        configuration={"max_tokens": 2},
+        target_outputs=[[1, 2]],
+        tree_outputs=[[1, 3]],
+        mismatches=[{"request": 0, "position": 1}],
+    )
+
+    assert report == {
+        "configuration": {"max_tokens": 2},
+        "target_outputs": [[1, 2]],
+        "tree_outputs": [[1, 3]],
+        "mismatches": [{"request": 0, "position": 1}],
+        "passed": False,
+    }
